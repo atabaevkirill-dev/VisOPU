@@ -284,7 +284,7 @@ class DeviceVisualization(QWidget):
         self.target_tilt = 0.0
         self.tilt_inverted = False
         self.display_tilt = 0.0  # smoothed display value (handles inversion seamlessly)
-        self.setMinimumSize(280, 320)
+        self.setMinimumSize(100, 100)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         self.timer = QTimer()
@@ -646,7 +646,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("TL.0009 ОПУ — ТехЛазер")
-        self.setMinimumSize(400, 500)
+        self.setMinimumSize(400, 300)
         self.resize(1150, 700)
 
         self.comm = DeviceCommunicator()
