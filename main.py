@@ -282,6 +282,8 @@ class DeviceVisualization(QWidget):
         self.tilt_angle = 0.0
         self.target_pan = 0.0
         self.target_tilt = 0.0
+        self.tilt_inverted = False
+        self.display_tilt = 0.0  # smoothed display value (handles inversion seamlessly)
         self.setMinimumSize(280, 320)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
@@ -293,6 +295,10 @@ class DeviceVisualization(QWidget):
         self.target_pan = pan
         self.target_tilt = tilt
 
+    def set_tilt_inverted(self, inv):
+        self.tilt_inverted = inv
+        self.update()
+
     def set_speeds(self, pan_spd, tilt_spd):
         pass
 
@@ -300,8 +306,11 @@ class DeviceVisualization(QWidget):
         # Shortest angular path for PAN (handles 360°/0° wrapping)
         pan_diff = ((self.target_pan - self.pan_angle + 180) % 360) - 180
         self.pan_angle = (self.pan_angle + pan_diff * 0.12) % 360
-        # TILT is linear, no wrapping needed
+        # TILT: smooth raw value
         self.tilt_angle += (self.target_tilt - self.tilt_angle) * 0.12
+        # Display tilt tracks raw value directly (D-Pad is already intuitive)
+        # Smooth display value for seamless transitions
+        self.display_tilt += (self.tilt_angle - self.display_tilt) * 0.12
         self.update()
 
     def paintEvent(self, event):
@@ -404,7 +413,7 @@ class DeviceVisualization(QWidget):
             p.drawLine(QPointF(bar_x - 6, ty), QPointF(bar_x + 6, ty))
             p.setFont(QFont("Consolas", 7))
             p.setPen(self.C_DIM)
-            label = f"+{deg}°" if deg >= 0 else f"{deg}°"
+            label = f"+{deg}°" if deg > 0 else f"{deg}°"
             p.drawText(QRectF(bar_x + 10, ty - 5, 36, 10),
                        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                        label)
@@ -415,8 +424,9 @@ class DeviceVisualization(QWidget):
         p.setPen(QPen(self.C_LABEL, 1.5))
         p.drawLine(QPointF(bar_x - 8, zero_y), QPointF(bar_x + 8, zero_y))
 
-        # TILT marker position: map [45..-90] to [bar_y1..bar_y2]
-        tilt_norm = (45 - self.tilt_angle) / 135.0
+        # TILT marker: use smoothed display_tilt mapped to bar range
+        clamped = max(-90.0, min(45.0, self.display_tilt))
+        tilt_norm = (45 - clamped) / 135.0
         my = bar_y1 + tilt_norm * bar_h
         my = max(bar_y1, min(bar_y2, my))
 
@@ -916,6 +926,9 @@ class MainWindow(QMainWindow):
         self.comm.connection_changed.connect(self._on_connection)
         self.comm.error_occurred.connect(lambda e: self._log(f"[ERR] {e}"))
         self.comm.log_message.connect(self._log)
+        # TILT invert checkbox syncs with visualization
+        self.tilt_invert_cb.toggled.connect(
+            lambda checked: self.viz.set_tilt_inverted(checked))
 
     # ════════════════ REAL DEVICE CALLBACKS ════════════════
     def _on_real_pan(self, v):
@@ -1041,38 +1054,39 @@ class MainWindow(QMainWindow):
         if d == 'STOP':
             self._stop_all()
             return
-        tilt_sign = self._get_tilt_sign()
-        # Read speed values from sliders
+        # Read speed values from sliders (absolute)
         pan_spd = self.pan_speed_ctrl.get_speed()
-        tilt_spd = self.tilt_speed_ctrl.get_speed() * tilt_sign
+        tilt_spd = self.tilt_speed_ctrl.get_speed()
         # If slider is at 0, use defaults
         if abs(pan_spd) < 0.1:
             pan_spd = 20.0
         if abs(tilt_spd) < 0.1:
-            tilt_spd = 10.0 * tilt_sign
-
-        # Map direction to (pan_speed, tilt_speed)
+            tilt_spd = 10.0
+    
+        # Map direction to (pan_speed, tilt_speed) — always intuitive
         dir_map = {
-            'UP':         (0.0,       tilt_spd),
-            'DOWN':       (0.0,      -abs(tilt_spd)),
+            'UP':         (0.0,           tilt_spd),
+            'DOWN':       (0.0,          -tilt_spd),
             'LEFT':       (-abs(pan_spd),  0.0),
             'RIGHT':      (abs(pan_spd),   0.0),
-            'UP_RIGHT':   (abs(pan_spd),   abs(tilt_spd) * tilt_sign),
-            'UP_LEFT':    (-abs(pan_spd),  abs(tilt_spd) * tilt_sign),
-            'DOWN_RIGHT': (abs(pan_spd),  -abs(tilt_spd) * tilt_sign),
-            'DOWN_LEFT':  (-abs(pan_spd), -abs(tilt_spd) * tilt_sign),
+            'UP_RIGHT':   (abs(pan_spd),   tilt_spd),
+            'UP_LEFT':    (-abs(pan_spd),  tilt_spd),
+            'DOWN_RIGHT': (abs(pan_spd),  -tilt_spd),
+            'DOWN_LEFT':  (-abs(pan_spd), -tilt_spd),
         }
         p_spd, t_spd = dir_map.get(d, (0, 0))
-
+    
         if self.is_connected:
+            # Apply inversion only for real device commands
+            tilt_sign = self._get_tilt_sign()
             if p_spd != 0:
                 self.comm.pan_set_speed(p_spd)
             if t_spd != 0:
-                self.comm.tilt_set_speed(t_spd)
-        else:
-            self.sim_pan_spd = p_spd
-            self.sim_tilt_spd = t_spd
-        self._log(f"[DPAD] {d} → PAN={p_spd:.0f} TILT={t_spd:.0f} °/s")
+                self.comm.tilt_set_speed(t_spd * tilt_sign)
+        # Sim: always intuitive — inversion doesn't affect visual direction
+        self.sim_pan_spd = p_spd
+        self.sim_tilt_spd = t_spd
+        self._log(f"[DPAD] {d} \u2192 PAN={p_spd:.0f} TILT={t_spd:.0f} °/s")
 
     def _on_dpad_released(self, d):
         if d == 'STOP':
