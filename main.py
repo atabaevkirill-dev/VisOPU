@@ -297,7 +297,10 @@ class DeviceVisualization(QWidget):
         pass
 
     def _tick(self):
-        self.pan_angle += (self.target_pan - self.pan_angle) * 0.12
+        # Shortest angular path for PAN (handles 360°/0° wrapping)
+        pan_diff = ((self.target_pan - self.pan_angle + 180) % 360) - 180
+        self.pan_angle = (self.pan_angle + pan_diff * 0.12) % 360
+        # TILT is linear, no wrapping needed
         self.tilt_angle += (self.target_tilt - self.tilt_angle) * 0.12
         self.update()
 
@@ -307,11 +310,15 @@ class DeviceVisualization(QWidget):
         p.fillRect(self.rect(), self.C_BG)
 
         w, h = self.width(), self.height()
-        cx, cy = w // 2, h // 2 - 20
-        R = min(w, h) * 0.34
+        # Shift compass left to make room for vertical TILT bar
+        cx, cy = w // 2 - 20, h // 2
+        R = min(w * 0.38, h * 0.34)
 
         self._draw_compass(p, cx, cy, R)
-        self._draw_tilt_bar(p, cx, cy + R + 55, w)
+        # Vertical TILT bar to the right of compass
+        bar_x = cx + R + 45
+        bar_h = R * 2
+        self._draw_tilt_bar(p, bar_x, cy - bar_h / 2, bar_h)
         self._draw_values(p, w)
         p.end()
 
@@ -381,44 +388,48 @@ class DeviceVisualization(QWidget):
         p.drawEllipse(QPointF(0, 0), 3, 3)
         p.restore()
 
-    def _draw_tilt_bar(self, p, bar_cx, bar_cy, w):
-        bar_w = min(w * 0.5, 180)
-        x1 = bar_cx - bar_w / 2
-        x2 = bar_cx + bar_w / 2
+    def _draw_tilt_bar(self, p, bar_x, bar_y1, bar_h):
+        """Vertical TILT bar: top = +45°, bottom = -90°, 0° marked."""
+        bar_y2 = bar_y1 + bar_h
 
         # Track line
         p.setPen(QPen(self.C_DIM, 2))
-        p.drawLine(QPointF(x1, bar_cy), QPointF(x2, bar_cy))
+        p.drawLine(QPointF(bar_x, bar_y1), QPointF(bar_x, bar_y2))
 
-        # Center mark
-        p.setPen(QPen(self.C_RING, 1))
-        p.drawLine(QPointF(bar_cx, bar_cy - 4), QPointF(bar_cx, bar_cy + 4))
+        # Tick marks at key angles
+        for deg in (45, 0, -45, -90):
+            norm = (45 - deg) / 135.0
+            ty = bar_y1 + norm * bar_h
+            p.setPen(QPen(self.C_RING, 1))
+            p.drawLine(QPointF(bar_x - 6, ty), QPointF(bar_x + 6, ty))
+            p.setFont(QFont("Consolas", 7))
+            p.setPen(self.C_DIM)
+            label = f"+{deg}°" if deg >= 0 else f"{deg}°"
+            p.drawText(QRectF(bar_x + 10, ty - 5, 36, 10),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                       label)
 
-        # TILT marker position: map [-90..45] to [x1..x2]
-        tilt_norm = (self.tilt_angle + 90) / 135.0
-        mx = x1 + tilt_norm * bar_w
-        mx = max(x1, min(x2, mx))
+        # 0° reference mark (more prominent)
+        zero_norm = 45.0 / 135.0
+        zero_y = bar_y1 + zero_norm * bar_h
+        p.setPen(QPen(self.C_LABEL, 1.5))
+        p.drawLine(QPointF(bar_x - 8, zero_y), QPointF(bar_x + 8, zero_y))
+
+        # TILT marker position: map [45..-90] to [bar_y1..bar_y2]
+        tilt_norm = (45 - self.tilt_angle) / 135.0
+        my = bar_y1 + tilt_norm * bar_h
+        my = max(bar_y1, min(bar_y2, my))
 
         # Marker diamond
         diamond = QPolygonF([
-            QPointF(mx, bar_cy - 6),
-            QPointF(mx + 5, bar_cy),
-            QPointF(mx, bar_cy + 6),
-            QPointF(mx - 5, bar_cy),
+            QPointF(bar_x, my - 6),
+            QPointF(bar_x + 5, my),
+            QPointF(bar_x, my + 6),
+            QPointF(bar_x - 5, my),
         ])
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(self.C_ARROW)
         p.drawPolygon(diamond)
-
-        # Labels
-        p.setFont(QFont("Consolas", 7))
-        p.setPen(self.C_DIM)
-        p.drawText(QRectF(x1 - 5, bar_cy + 6, 24, 10),
-                   Qt.AlignmentFlag.AlignCenter, "-90°")
-        p.drawText(QRectF(x2 - 19, bar_cy + 6, 24, 10),
-                   Qt.AlignmentFlag.AlignCenter, "+45°")
-        p.drawText(QRectF(bar_cx - 10, bar_cy + 6, 20, 10),
-                   Qt.AlignmentFlag.AlignCenter, "0°")
 
     def _draw_values(self, p, w):
         # Compact value readout at top
@@ -654,9 +665,11 @@ class MainWindow(QMainWindow):
         self.sim_timer.start(30)
 
     def resizeEvent(self, event):
-        """Hide side panels when window is too narrow."""
+        """Hide side panels when window is too narrow; hide compass when too short."""
         super().resizeEvent(event)
         w = event.size().width()
+        h = event.size().height()
+        # Width: side panels
         # < 700px: hide both side panels, only controls visible
         # < 950px: hide right panel only
         # >= 950px: show all
@@ -669,6 +682,8 @@ class MainWindow(QMainWindow):
         else:
             self.left_container.setVisible(True)
             self.right_container.setVisible(True)
+        # Height: hide compass when window is short, keep only D-Pad
+        self.compass_panel.setVisible(h >= 500)
 
     # ════════════════ UI BUILD ════════════════
     def _build_ui(self):
@@ -804,12 +819,12 @@ class MainWindow(QMainWindow):
         center = QVBoxLayout()
 
         # Compass in a collapsible framed window
-        compass_panel = CollapsiblePanel("COMPASS")
+        self.compass_panel = CollapsiblePanel("COMPASS")
         compass_inner = QVBoxLayout()
         self.viz = DeviceVisualization()
         compass_inner.addWidget(self.viz)
-        compass_panel.content_layout().addLayout(compass_inner)
-        center.addWidget(compass_panel, 1)
+        self.compass_panel.content_layout().addLayout(compass_inner)
+        center.addWidget(self.compass_panel, 1)
 
         # D-Pad in a collapsible framed window
         dpad_panel = CollapsiblePanel("CONTROL PAD")
