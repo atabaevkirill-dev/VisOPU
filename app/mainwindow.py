@@ -1,0 +1,849 @@
+"""Main application window for VisOPU."""
+
+import threading
+from datetime import datetime
+from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                              QPushButton, QLabel, QFrame, QGridLayout,
+                              QSpinBox, QDoubleSpinBox, QLineEdit, QCheckBox,
+                              QPlainTextEdit, QComboBox, QSplitter,
+                              QDialog, QFormLayout, QDialogButtonBox, QMenu,
+                              QSizePolicy)
+from PyQt6.QtCore import Qt, QTimer, QPoint, QSettings, QObject
+from PyQt6.QtGui import QAction, QFont, QColor
+
+from app.communicators import DeviceCommunicator, LaserCommunicator
+from app.widgets import (CollapsiblePanel, DirectionPad,
+                          SpeedControl, CameraWidget, SlidingPanel, HAS_CV2)
+from app.styles import (apply_apple_dark_style, STYLE_GO_BUTTON, STYLE_STOP_ALL,
+                         STYLE_HOME_BUTTON, STYLE_DIAG_BUTTON, STYLE_LOG_TEXT,
+                         COLOR_CONNECTED, COLOR_DISCONNECTED, COLOR_ERROR,
+                         COLOR_ACTIVE)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CONNECTION DIALOG
+# ═══════════════════════════════════════════════════════════════════
+
+class ConnectionDialog(QDialog):
+    """Generic connection dialog for devices."""
+
+    def __init__(self, title, fields, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(340)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.inputs = {}
+        for label, default, echo in fields:
+            inp = QLineEdit(str(default))
+            if echo == "password":
+                inp.setEchoMode(QLineEdit.EchoMode.Password)
+            self.inputs[label] = inp
+            form.addRow(label, inp)
+        layout.addLayout(form)
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def get_values(self):
+        return {k: v.text() for k, v in self.inputs.items()}
+
+
+class _HideOnCloseFilter(QObject):
+    """Event filter that hides a window on close instead of destroying it."""
+    def eventFilter(self, obj, event):
+        if event.type() == event.Type.Close:
+            event.ignore()
+            obj.hide()
+            return True
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MAIN WINDOW
+# ═══════════════════════════════════════════════════════════════════
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("TL.0009 ОПУ — ТехЛазер")
+        self.setMinimumSize(400, 300)
+        self.resize(1150, 700)
+
+        self.comm = DeviceCommunicator()
+        self.is_connected = False
+
+        self.laser_comm = LaserCommunicator()
+        self.laser_connected = False
+
+        # Camera state
+        self.cam1_widget = None
+        self.cam2_widget = None
+        self.cam1_connected = False
+        self.cam2_connected = False
+
+        # Connection settings storage (defaults)
+        self._pan_tilt_ip = "192.168.1.115"
+        self._pan_tilt_port = 9760
+        self._laser_ip = "192.168.1.7"
+        self._laser_port = 20108
+        self._cam1_ip = "192.168.1.10"
+        self._cam1_user = "admin"
+        self._cam1_pass = "admin"
+        self._cam2_ip = "192.168.1.11"
+        self._cam2_user = "admin"
+        self._cam2_pass = "admin"
+
+        # Persistent settings
+        self._settings = QSettings("VisOPU", "TL0009")
+        self._load_settings()
+
+        # Real device state
+        self.real_pan = 0.0
+        self.real_tilt = 0.0
+        self.real_pan_spd = 0.0
+        self.real_tilt_spd = 0.0
+        self.real_temp = 0.0
+
+        # Simulation state
+        self.sim_pan = 0.0
+        self.sim_tilt = 0.0
+        self.sim_pan_spd = 0.0
+        self.sim_tilt_spd = 0.0
+
+        self._build_menu()
+        self._build_ui()
+        apply_apple_dark_style(self)
+        self._connect_signals()
+
+        # Status bar
+        self.statusBar().showMessage("Ready")
+
+        # Simulation timer
+        self.sim_timer = QTimer()
+        self.sim_timer.timeout.connect(self._simulate)
+        self.sim_timer.start(30)
+
+    # ════════════════ MENU BAR ════════════════
+    def _build_menu(self):
+        menubar = self.menuBar()
+        dev_menu = menubar.addMenu("&Devices")
+
+        act_pt = QAction("PAN-TILT Connection...", self)
+        act_pt.triggered.connect(self._connect_pan_tilt_dialog)
+        dev_menu.addAction(act_pt)
+
+        act_las = QAction("LASER Connection...", self)
+        act_las.triggered.connect(self._connect_laser_dialog)
+        dev_menu.addAction(act_las)
+
+        dev_menu.addSeparator()
+
+        act_cam1 = QAction("CAM1 (IP Camera)...", self)
+        act_cam1.triggered.connect(self._connect_cam1_dialog)
+        dev_menu.addAction(act_cam1)
+
+        act_cam2 = QAction("CAM2 (Thermal)...", self)
+        act_cam2.triggered.connect(self._connect_cam2_dialog)
+        dev_menu.addAction(act_cam2)
+
+        dev_menu.addSeparator()
+
+        act_ret = QAction("Reticle: Crosshair", self)
+        self._reticle_action = act_ret
+        ret_menu = dev_menu.addMenu("Reticle")
+        for name, idx in [("Crosshair", 0), ("Mil-Dot", 1), ("Combat", 2)]:
+            a = QAction(name, self)
+            a.triggered.connect(lambda checked, i=idx: self._set_reticle(i))
+            ret_menu.addAction(a)
+
+        # View menu
+        view_menu = menubar.addMenu("&View")
+        self._view_menu = view_menu
+
+    # ════════════════ SETTINGS PERSISTENCE ════════════════
+    def _load_settings(self):
+        """Load saved connection parameters."""
+        s = self._settings
+        self._pan_tilt_ip = s.value("pan_tilt_ip", self._pan_tilt_ip)
+        self._pan_tilt_port = int(s.value("pan_tilt_port", self._pan_tilt_port))
+        self._laser_ip = s.value("laser_ip", self._laser_ip)
+        self._laser_port = int(s.value("laser_port", self._laser_port))
+        self._cam1_ip = s.value("cam1_ip", self._cam1_ip)
+        self._cam1_user = s.value("cam1_user", self._cam1_user)
+        self._cam1_pass = s.value("cam1_pass", self._cam1_pass)
+        self._cam2_ip = s.value("cam2_ip", self._cam2_ip)
+        self._cam2_user = s.value("cam2_user", self._cam2_user)
+        self._cam2_pass = s.value("cam2_pass", self._cam2_pass)
+
+    def _save_settings(self):
+        """Save connection parameters to persistent storage."""
+        s = self._settings
+        s.setValue("pan_tilt_ip", self._pan_tilt_ip)
+        s.setValue("pan_tilt_port", self._pan_tilt_port)
+        s.setValue("laser_ip", self._laser_ip)
+        s.setValue("laser_port", self._laser_port)
+        s.setValue("cam1_ip", self._cam1_ip)
+        s.setValue("cam1_user", self._cam1_user)
+        s.setValue("cam1_pass", self._cam1_pass)
+        s.setValue("cam2_ip", self._cam2_ip)
+        s.setValue("cam2_user", self._cam2_user)
+        s.setValue("cam2_pass", self._cam2_pass)
+        # Save cameras window geometry
+        if hasattr(self, '_cameras_win'):
+            s.setValue("cam_win_geometry", self._cameras_win.geometry())
+
+    # ════════════════ CONNECTION DIALOGS ════════════════
+    def _connect_pan_tilt_dialog(self):
+        dlg = ConnectionDialog("PAN-TILT Connection", [
+            ("IP:", self._pan_tilt_ip, "text"),
+            ("Port:", self._pan_tilt_port, "text"),
+        ], self)
+        if dlg.exec():
+            vals = dlg.get_values()
+            self._pan_tilt_ip = vals["IP:"]
+            self._pan_tilt_port = int(vals["Port:"])
+            self._save_settings()
+            if self.is_connected:
+                self.comm.disconnect_device()
+            self.comm.connect_device(self._pan_tilt_ip, self._pan_tilt_port)
+            self._log(f"[PAN-TILT] Connecting {self._pan_tilt_ip}:{self._pan_tilt_port}")
+
+    def _connect_laser_dialog(self):
+        dlg = ConnectionDialog("LASER Connection", [
+            ("IP:", self._laser_ip, "text"),
+            ("Port:", self._laser_port, "text"),
+        ], self)
+        if dlg.exec():
+            vals = dlg.get_values()
+            self._laser_ip = vals["IP:"]
+            self._laser_port = int(vals["Port:"])
+            self._save_settings()
+            if self.laser_connected:
+                self.laser_comm.disconnect_device()
+            self.laser_comm.connect_device(self._laser_ip, self._laser_port)
+            self._log(f"[LASER] Connecting {self._laser_ip}:{self._laser_port}")
+
+    def _connect_cam1_dialog(self):
+        dlg = ConnectionDialog("CAM1 — IP Camera", [
+            ("IP:", self._cam1_ip, "text"),
+            ("User:", self._cam1_user, "text"),
+            ("Pass:", self._cam1_pass, "password"),
+            ("RTSP:", "rtsp://{user}:{pass}@{ip}:554/stream1", "text"),
+        ], self)
+        if dlg.exec():
+            vals = dlg.get_values()
+            self._cam1_ip = vals["IP:"]
+            self._cam1_user = vals["User:"]
+            self._cam1_pass = vals["Pass:"]
+            self._save_settings()
+            url = vals["RTSP:"].replace("{ip}", self._cam1_ip)
+            url = url.replace("{user}", self._cam1_user).replace("{pass}", self._cam1_pass)
+            self._connect_cam_stream(1, url, is_thermal=False)
+
+    def _connect_cam2_dialog(self):
+        dlg = ConnectionDialog("CAM2 — Thermal Camera", [
+            ("IP:", self._cam2_ip, "text"),
+            ("User:", self._cam2_user, "text"),
+            ("Pass:", self._cam2_pass, "password"),
+            ("RTSP:", "rtsp://{user}:{pass}@{ip}:554/stream1", "text"),
+        ], self)
+        if dlg.exec():
+            vals = dlg.get_values()
+            self._cam2_ip = vals["IP:"]
+            self._cam2_user = vals["User:"]
+            self._cam2_pass = vals["Pass:"]
+            self._save_settings()
+            url = vals["RTSP:"].replace("{ip}", self._cam2_ip)
+            url = url.replace("{user}", self._cam2_user).replace("{pass}", self._cam2_pass)
+            self._connect_cam_stream(2, url, is_thermal=True)
+
+    def _connect_cam_stream(self, cam_idx, url, is_thermal):
+        widget = self.cam1_widget if cam_idx == 1 else self.cam2_widget
+        if not HAS_CV2:
+            self._log("[CAM] OpenCV not installed — pip install opencv-python")
+            return
+        if widget.streaming:
+            widget.disconnect_stream()
+            self._log(f"[CAM] CAM{cam_idx} disconnected")
+            c = COLOR_DISCONNECTED
+            s = "OFF"
+        else:
+            ok = widget.connect_stream(url, is_thermal)
+            if ok:
+                self._log(f"[CAM] CAM{cam_idx} connected: {url}")
+                # Show and raise cameras window
+                self._cameras_win.show()
+                self._cameras_win.raise_()
+                c = COLOR_CONNECTED
+                s = "ON"
+            else:
+                self._log(f"[CAM] CAM{cam_idx} connection failed")
+                c = COLOR_ERROR
+                s = "ERR"
+        # Update status indicator
+        lbl = self.cam1_status_lbl if cam_idx == 1 else self.cam2_status_lbl
+        lbl.setText(f"● CAM{cam_idx}: {s}")
+        lbl.setStyleSheet(f"color:{c}; font:600 11px 'SF Pro Display';")
+
+    def _set_reticle(self, idx):
+        if self.cam1_widget:
+            self.cam1_widget.set_reticle(idx)
+        if self.cam2_widget:
+            self.cam2_widget.set_reticle(idx)
+        names = ["Crosshair", "Mil-Dot", "Combat"]
+        self._reticle_action.setText(f"Reticle: {names[idx]}")
+        self._log(f"[CAM] Reticle: {names[idx]}")
+
+    # ════════════════ VIEW TOGGLES ════════════════
+    def _toggle_cameras_view(self):
+        if self._cameras_win.isVisible():
+            self._cameras_win.hide()
+        else:
+            self._cameras_win.show()
+            self._cameras_win.raise_()
+
+    # ════════════════ RESIZE ════════════════
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+
+    def closeEvent(self, event):
+        self._save_settings()
+        if hasattr(self, '_cameras_win'):
+            self._cameras_win.deleteLater()
+        super().closeEvent(event)
+
+    # ════════════════ UI BUILD ════════════════
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QHBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ─── LEFT SLIDING PANEL ───
+        self.left_panel = SlidingPanel(240, side='left')
+        left_content = QWidget()
+        left = QVBoxLayout(left_content)
+        left.setContentsMargins(8, 8, 8, 8)
+        left.setSpacing(2)
+
+        # Status indicators (compact)
+        status_panel = CollapsiblePanel("DEVICE STATUS")
+        sl = QGridLayout()
+        sl.setSpacing(4)
+        self.pt_status_lbl = QLabel("● PAN-TILT: OFF")
+        self.pt_status_lbl.setStyleSheet(f"color:{COLOR_DISCONNECTED}; font:600 11px 'SF Pro Display';")
+        self.laser_status_lbl = QLabel("● LASER: OFF")
+        self.laser_status_lbl.setStyleSheet(f"color:{COLOR_DISCONNECTED}; font:600 11px 'SF Pro Display';")
+        self.cam1_status_lbl = QLabel("● CAM1: OFF")
+        self.cam1_status_lbl.setStyleSheet(f"color:{COLOR_DISCONNECTED}; font:600 11px 'SF Pro Display';")
+        self.cam2_status_lbl = QLabel("● CAM2: OFF")
+        self.cam2_status_lbl.setStyleSheet(f"color:{COLOR_DISCONNECTED}; font:600 11px 'SF Pro Display';")
+        sl.addWidget(self.pt_status_lbl, 0, 0)
+        sl.addWidget(self.laser_status_lbl, 1, 0)
+        sl.addWidget(self.cam1_status_lbl, 2, 0)
+        sl.addWidget(self.cam2_status_lbl, 3, 0)
+        status_panel.content_layout().addLayout(sl)
+        left.addWidget(status_panel)
+
+        # Speed setting
+        spd = CollapsiblePanel("SPEED SETTING")
+        spdl = QVBoxLayout()
+        self.pan_speed_ctrl = SpeedControl("PAN SPEED °/s", -50, 50)
+        spdl.addWidget(self.pan_speed_ctrl)
+        self.tilt_speed_ctrl = SpeedControl("TILT SPEED °/s", -20, 20)
+        spdl.addWidget(self.tilt_speed_ctrl)
+        spd.content_layout().addLayout(spdl)
+        left.addWidget(spd)
+
+        # Go-to position
+        pos = CollapsiblePanel("GO TO POSITION")
+        pl = QGridLayout()
+        pl.addWidget(QLabel("PAN °:"), 0, 0)
+        self.pan_pos_spin = QDoubleSpinBox()
+        self.pan_pos_spin.setRange(0, 359.99)
+        self.pan_pos_spin.setDecimals(2)
+        pl.addWidget(self.pan_pos_spin, 0, 1)
+        pl.addWidget(QLabel("TILT °:"), 1, 0)
+        self.tilt_pos_spin = QDoubleSpinBox()
+        self.tilt_pos_spin.setRange(-90, 45)
+        self.tilt_pos_spin.setDecimals(2)
+        pl.addWidget(self.tilt_pos_spin, 1, 1)
+        go_btn = QPushButton("GO")
+        go_btn.setStyleSheet(STYLE_GO_BUTTON)
+        go_btn.clicked.connect(self._goto_position)
+        pl.addWidget(go_btn, 2, 0, 1, 2)
+        pos.content_layout().addLayout(pl)
+        left.addWidget(pos)
+
+        # STOP ALL
+        stop_btn = QPushButton("⬛  STOP ALL")
+        stop_btn.setStyleSheet(STYLE_STOP_ALL)
+        stop_btn.clicked.connect(self._stop_all)
+        left.addWidget(stop_btn)
+
+        # HOME button
+        home_btn = QPushButton("⌂  HOME (0° / 0°)")
+        home_btn.setStyleSheet(STYLE_HOME_BUTTON)
+        home_btn.clicked.connect(self._go_home)
+        left.addWidget(home_btn)
+
+        # TILT invert + Diagnostics
+        diag = CollapsiblePanel("TILT & DIAGNOSTICS")
+        dl = QVBoxLayout()
+        self.tilt_invert_cb = QCheckBox("Invert TILT axis")
+        self.tilt_invert_cb.setStyleSheet("color:#98989d; font:600 11px 'SF Pro Display';")
+        dl.addWidget(self.tilt_invert_cb)
+        diag_row = QHBoxLayout()
+        pan_diag_btn = QPushButton("PAN DIAG")
+        pan_diag_btn.setStyleSheet(STYLE_DIAG_BUTTON)
+        pan_diag_btn.clicked.connect(self._pan_diag)
+        diag_row.addWidget(pan_diag_btn)
+        tilt_diag_btn = QPushButton("TILT DIAG")
+        tilt_diag_btn.setStyleSheet(STYLE_DIAG_BUTTON)
+        tilt_diag_btn.clicked.connect(self._tilt_diag)
+        diag_row.addWidget(tilt_diag_btn)
+        dl.addLayout(diag_row)
+        diag.content_layout().addLayout(dl)
+        left.addWidget(diag)
+
+        left.addStretch()
+        self.left_panel.set_content_layout(left)
+        root.addWidget(self.left_panel)
+
+        # ─── CENTER — D-Pad only ───
+        center = QVBoxLayout()
+        center.setContentsMargins(4, 0, 4, 0)
+        center.setSpacing(8)
+
+        # Create camera widgets for the floating cameras window
+        self.cam1_widget = CameraWidget("CAM1 — IP")
+        self.cam2_widget = CameraWidget("CAM2 — THERMAL")
+        self.cam2_widget.is_thermal = True
+
+        # ─── FLOATING CAMERAS WINDOW (draggable, resizable) ───
+        self._cameras_win = QWidget(self, Qt.WindowType.Window)
+        self._cameras_win.setWindowTitle("CAMERAS")
+        self._cameras_win.resize(900, 400)
+        self._cameras_win.setMinimumSize(300, 200)
+        self._cameras_win.setStyleSheet("background:#1e1e1e;")
+
+        # Hide on close instead of destroy
+        self._cam_close_filter = _HideOnCloseFilter(self._cameras_win)
+        self._cameras_win.installEventFilter(self._cam_close_filter)
+
+        cam_layout = QVBoxLayout(self._cameras_win)
+        cam_layout.setContentsMargins(0, 0, 0, 0)
+        cam_layout.setSpacing(0)
+
+        # Title bar
+        cam_hdr = QLabel("  CAMERAS")
+        cam_hdr.setFixedHeight(28)
+        cam_hdr.setStyleSheet(
+            "color:#98989d; font:600 10px 'SF Pro Display'; "
+            "background:#2d2d2d; border-bottom:1px solid #3c3c3c;")
+        cam_layout.addWidget(cam_hdr)
+
+        # Splitter for side-by-side cameras
+        cam_splitter = QSplitter(Qt.Orientation.Horizontal)
+        cam_splitter.setHandleWidth(3)
+        cam_splitter.setStyleSheet("""
+            QSplitter::handle {
+                background: #3c3c3c;
+            }
+            QSplitter::handle:hover {
+                background: #0a84ff;
+            }
+        """)
+        cam_splitter.addWidget(self.cam1_widget)
+        cam_splitter.addWidget(self.cam2_widget)
+        cam_splitter.setStretchFactor(0, 1)
+        cam_splitter.setStretchFactor(1, 1)
+        cam_layout.addWidget(cam_splitter, 1)
+
+        # Position the cameras window next to the main window
+        saved_geom = self._settings.value("cam_win_geometry")
+        if saved_geom and hasattr(saved_geom, 'isValid') and saved_geom.isValid():
+            self._cameras_win.setGeometry(saved_geom)
+        else:
+            self._cameras_win.move(
+                self.pos().x() + self.width() + 20,
+                self.pos().y())
+        self._cameras_win.show()
+
+        # View menu action for cameras window
+        act_cams = QAction("Cameras Window", self)
+        act_cams.triggered.connect(self._toggle_cameras_view)
+        self._view_menu.addAction(act_cams)
+
+        # D-Pad
+        dpad_panel = CollapsiblePanel("CONTROL PAD")
+        dpad_inner = QHBoxLayout()
+        dpad_inner.addStretch()
+        self.dpad = DirectionPad()
+        self.dpad.direction_pressed.connect(self._on_dpad_pressed)
+        self.dpad.direction_released.connect(self._on_dpad_released)
+        dpad_inner.addWidget(self.dpad)
+        dpad_inner.addStretch()
+        dpad_panel.content_layout().addLayout(dpad_inner)
+        center.addWidget(dpad_panel, 0)
+
+        root.addLayout(center, 1)
+
+        # ─── RIGHT SLIDING PANEL ───
+        self.right_panel = SlidingPanel(220, side='right')
+        right_content = QWidget()
+        right = QVBoxLayout(right_content)
+        right.setContentsMargins(8, 8, 8, 8)
+        right.setSpacing(2)
+
+        # Laser rangefinder controls
+        laser = CollapsiblePanel("LASER RANGEFINDER")
+        las = QVBoxLayout()
+        self.laser_dist_lbl = QLabel("---.- m")
+        self.laser_dist_lbl.setStyleSheet("color:#0a84ff; font:600 20px 'SF Pro Display';")
+        self.laser_dist_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        las.addWidget(self.laser_dist_lbl)
+        self.laser_target_lbl = QLabel("NO TARGET")
+        self.laser_target_lbl.setStyleSheet("color:#636366; font:600 10px 'SF Pro Display';")
+        self.laser_target_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        las.addWidget(self.laser_target_lbl)
+        las_btns = QHBoxLayout()
+        single_btn = QPushButton("SINGLE")
+        single_btn.clicked.connect(self._laser_single)
+        las_btns.addWidget(single_btn)
+        self.laser_cont_btn = QPushButton("CONT")
+        self.laser_cont_btn.clicked.connect(self._laser_continuous)
+        las_btns.addWidget(self.laser_cont_btn)
+        las.addLayout(las_btns)
+        las_stop_btn = QPushButton("STOP")
+        las_stop_btn.clicked.connect(self._laser_stop)
+        las.addWidget(las_stop_btn)
+        las_diag_btn = QPushButton("SELF-CHECK")
+        las_diag_btn.clicked.connect(self._laser_selfcheck)
+        las.addWidget(las_diag_btn)
+        laser.content_layout().addLayout(las)
+        right.addWidget(laser)
+
+        # Device state
+        st = CollapsiblePanel("DEVICE STATE")
+        sg = QGridLayout()
+        sg.setSpacing(4)
+        self.pan_pos_lbl = QLabel("0.00°")
+        self.tilt_pos_lbl = QLabel("0.00°")
+        self.pan_spd_lbl = QLabel("0.0 °/s")
+        self.tilt_spd_lbl = QLabel("0.0 °/s")
+        self.temp_lbl = QLabel("-- °C")
+        self.action_lbl = QLabel("IDLE")
+        for i, (name, val) in enumerate([
+            ("PAN:", self.pan_pos_lbl), ("TILT:", self.tilt_pos_lbl),
+            ("PAN SPD:", self.pan_spd_lbl), ("TILT SPD:", self.tilt_spd_lbl),
+            ("TEMP:", self.temp_lbl), ("STATUS:", self.action_lbl),
+        ]):
+            nl = QLabel(name)
+            nl.setStyleSheet("color:#636366; font:10px 'SF Pro Display';")
+            val.setStyleSheet("color:#f5f5f7; font:600 11px 'SF Pro Display';")
+            sg.addWidget(nl, i, 0)
+            sg.addWidget(val, i, 1)
+        st.content_layout().addLayout(sg)
+        right.addWidget(st)
+
+        # Log
+        lg = CollapsiblePanel("PROTOCOL LOG")
+        ll = QVBoxLayout()
+        self.log_text = QPlainTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumBlockCount(25)
+        self.log_text.setStyleSheet(STYLE_LOG_TEXT)
+        self.log_text.setFixedHeight(200)
+        ll.addWidget(self.log_text)
+        lg.content_layout().addLayout(ll)
+        right.addWidget(lg)
+
+        right.addStretch()
+        self.right_panel.set_content_layout(right)
+        root.addWidget(self.right_panel)
+
+    # ════════════════ SIGNALS ════════════════
+    def _connect_signals(self):
+        self.comm.pan_position_updated.connect(self._on_real_pan)
+        self.comm.tilt_position_updated.connect(self._on_real_tilt)
+        self.comm.pan_speed_updated.connect(self._on_real_pan_spd)
+        self.comm.tilt_speed_updated.connect(self._on_real_tilt_spd)
+        self.comm.temperature_updated.connect(self._on_real_temp)
+        self.comm.connection_changed.connect(self._on_connection)
+        self.comm.error_occurred.connect(lambda e: self._log(f"[ERR] {e}"))
+        self.comm.log_message.connect(self._log)
+        self.laser_comm.distance_updated.connect(self._on_laser_distance)
+        self.laser_comm.connection_changed.connect(self._on_laser_connection)
+        self.laser_comm.error_occurred.connect(lambda e: self._log(f"[LASER ERR] {e}"))
+        self.laser_comm.log_message.connect(self._log)
+
+    # ════════════════ CALLBACKS ════════════════
+    def _on_real_pan(self, v):
+        self.real_pan = v
+        self.pan_pos_lbl.setText(f"{v:.2f}°")
+
+    def _on_real_tilt(self, v):
+        self.real_tilt = v
+        self.tilt_pos_lbl.setText(f"{v:.2f}°")
+
+    def _on_real_pan_spd(self, v):
+        self.real_pan_spd = v
+        self.pan_spd_lbl.setText(f"{v:.1f} °/s")
+        self.action_lbl.setText("MOVING" if abs(v) > 0.1 else "IDLE")
+        self.action_lbl.setStyleSheet(
+            f"color:{COLOR_ACTIVE};font:600 11px 'SF Pro Display';" if abs(v) > 0.1
+            else "color:#f5f5f7;font:600 11px 'SF Pro Display';")
+
+    def _on_real_tilt_spd(self, v):
+        self.real_tilt_spd = v
+        self.tilt_spd_lbl.setText(f"{v:.1f} °/s")
+
+    def _on_real_temp(self, v):
+        self.real_temp = v
+        self.temp_lbl.setText(f"{v:.1f} °C")
+
+    def _on_connection(self, connected):
+        self.is_connected = connected
+        c = COLOR_CONNECTED if connected else COLOR_DISCONNECTED
+        s = "ON" if connected else "OFF"
+        self.pt_status_lbl.setText(f"● PAN-TILT: {s}")
+        self.pt_status_lbl.setStyleSheet(f"color:{c}; font:600 11px 'SF Pro Display';")
+        self._log(f"[PAN-TILT] {'Connected' if connected else 'Disconnected'}")
+
+    def _on_laser_connection(self, connected):
+        self.laser_connected = connected
+        c = COLOR_CONNECTED if connected else COLOR_DISCONNECTED
+        s = "ON" if connected else "OFF"
+        self.laser_status_lbl.setText(f"● LASER: {s}")
+        self.laser_status_lbl.setStyleSheet(f"color:{c}; font:600 11px 'SF Pro Display';")
+        self._log(f"[LASER] {'Connected' if connected else 'Disconnected'}")
+
+    # ════════════════ ACTIONS ════════════════
+    def _get_tilt_sign(self):
+        return -1 if self.tilt_invert_cb.isChecked() else 1
+
+    def _stop_all(self):
+        if self.is_connected:
+            self.comm.stop_all()
+        self.sim_pan_spd = 0.0
+        self.sim_tilt_spd = 0.0
+        self.pan_speed_ctrl.reset()
+        self.tilt_speed_ctrl.reset()
+        self._log("STOP ALL: $u# + $U#")
+
+    def _go_home(self):
+        if self.is_connected:
+            self.comm.pan_goto(0.0)
+            self.comm.tilt_goto(0.0)
+        else:
+            self.sim_pan_spd = 0
+            self.sim_tilt_spd = 0
+            self.sim_pan = 0.0
+            self.sim_tilt = 0.0
+        self._log("HOME: PAN→0° TILT→0°")
+
+    def _pan_diag(self):
+        if self.is_connected:
+            self.comm.pan_diag()
+            self._log("DIAG: PAN self-diagnostics started ($m,1#)")
+        else:
+            self.sim_pan_spd = 30.0
+            self._log("[SIM] DIAG: PAN self-diagnostics (rotating 360°)")
+            QTimer.singleShot(12000, lambda: self._sim_diag_done('pan'))
+
+    def _tilt_diag(self):
+        if self.is_connected:
+            self.comm.tilt_diag()
+            self._log("DIAG: TILT self-diagnostics started ($M,1#)")
+        else:
+            self.sim_tilt_spd = 10.0
+            self._log("[SIM] DIAG: TILT self-diagnostics (cycling)")
+            QTimer.singleShot(5000, lambda: self._sim_diag_done('tilt_neg'))
+            QTimer.singleShot(10000, lambda: self._sim_diag_done('tilt_zero'))
+
+    def _sim_diag_done(self, axis):
+        if axis == 'pan':
+            self.sim_pan_spd = 0
+            self.sim_pan = 0.0
+            self._log("[SIM] DIAG: PAN done → 0°")
+        elif axis == 'tilt_neg':
+            self.sim_tilt_spd = -10.0
+        elif axis == 'tilt_zero':
+            self.sim_tilt_spd = 0
+            self.sim_tilt = 0.0
+            self._log("[SIM] DIAG: TILT done → 0°")
+
+    def _goto_position(self):
+        pan = self.pan_pos_spin.value()
+        tilt = self.tilt_pos_spin.value()
+        if self.is_connected:
+            self.comm.pan_goto(pan)
+            self.comm.tilt_goto(tilt)
+        else:
+            self.sim_pan_spd = 0
+            self.sim_tilt_spd = 0
+            self.sim_pan = pan
+            self.sim_tilt = tilt
+        self._log(f"GOTO: PAN={pan:.2f}° TILT={tilt:.2f}°")
+
+    # ════════════════ LASER ════════════════
+    def _on_laser_distance(self, dist, status):
+        self.laser_dist_lbl.setText(f"{dist:.1f} m")
+        if status & 0x0F == 0x04:
+            self.laser_target_lbl.setText("OUT OF RANGE")
+            self.laser_target_lbl.setStyleSheet(
+                f"color:{COLOR_ERROR}; font:600 10px 'SF Pro Display';")
+        else:
+            flags = []
+            if status & 0x01: flags.append("NEAR")
+            if status & 0x02: flags.append("FAR")
+            multi = (status >> 4) & 0x0F
+            label = "TARGET"
+            if flags: label = " + ".join(flags)
+            if multi > 0: label += f" (#{multi + 1})"
+            self.laser_target_lbl.setText(label)
+            self.laser_target_lbl.setStyleSheet(
+                "color:#f5f5f7; font:600 10px 'SF Pro Display';")
+
+    def _laser_single(self):
+        if not self.laser_connected:
+            self._log("[LASER] Not connected")
+            return
+        threading.Thread(target=self._do_laser_single, daemon=True).start()
+
+    def _do_laser_single(self):
+        result = self.laser_comm.single_range()
+        if result:
+            dist, status = result
+            self._log(f"[LASER] Range: {dist:.1f} m  status=0x{status:02X}")
+        else:
+            self._log("[LASER] Single range: no response")
+
+    def _laser_continuous(self):
+        if not self.laser_connected:
+            self._log("[LASER] Not connected")
+            return
+        if self.laser_comm.polling:
+            self.laser_comm.stop_continuous()
+            self.laser_cont_btn.setText("CONT")
+            self._log("[LASER] Continuous ranging stopped")
+        else:
+            self.laser_comm.start_continuous()
+            self.laser_cont_btn.setText("STOP CONT")
+            self._log("[LASER] Continuous ranging started")
+
+    def _laser_stop(self):
+        if self.laser_comm.polling:
+            self.laser_comm.stop_continuous()
+            self.laser_cont_btn.setText("CONT")
+        self.laser_dist_lbl.setText("---.- m")
+        self.laser_target_lbl.setText("NO TARGET")
+        self.laser_target_lbl.setStyleSheet(
+            "color:#636366; font:600 10px 'SF Pro Display';")
+        self._log("[LASER] Ranging stopped, display cleared")
+
+    def _laser_selfcheck(self):
+        if not self.laser_connected:
+            self._log("[LASER] Not connected")
+            return
+        threading.Thread(target=self._do_laser_selfcheck, daemon=True).start()
+
+    def _do_laser_selfcheck(self):
+        resp = self.laser_comm.self_check()
+        if resp and len(resp) >= 10:
+            s = resp[5:9]
+            self._log(f"[LASER] Self-check: status bytes {s.hex()}")
+            s1 = s[2]
+            s0 = s[3]
+            checks = []
+            checks.append("FPGA:" + ("OK" if s1 & 0x01 else "ERR"))
+            checks.append("Temp:" + ("OK" if s1 & 0x40 else "ERR"))
+            checks.append("Bias:" + ("OK" if s1 & 0x20 else "ERR"))
+            checks.append("5V6:" + ("OK" if s0 & 0x01 else "ERR"))
+            self._log(f"[LASER] Health: {' | '.join(checks)}")
+        else:
+            self._log("[LASER] Self-check: no response")
+
+    # ════════════════ D-PAD ════════════════
+    def _on_dpad_pressed(self, d):
+        if d == 'STOP':
+            self._stop_all()
+            return
+        pan_spd = self.pan_speed_ctrl.get_speed()
+        tilt_spd = self.tilt_speed_ctrl.get_speed()
+        if abs(pan_spd) < 0.1:
+            pan_spd = 20.0
+        if abs(tilt_spd) < 0.1:
+            tilt_spd = 10.0
+        dir_map = {
+            'UP':         (0.0,           tilt_spd),
+            'DOWN':       (0.0,          -tilt_spd),
+            'LEFT':       (-abs(pan_spd),  0.0),
+            'RIGHT':      (abs(pan_spd),   0.0),
+            'UP_RIGHT':   (abs(pan_spd),   tilt_spd),
+            'UP_LEFT':    (-abs(pan_spd),  tilt_spd),
+            'DOWN_RIGHT': (abs(pan_spd),  -tilt_spd),
+            'DOWN_LEFT':  (-abs(pan_spd), -tilt_spd),
+        }
+        p_spd, t_spd = dir_map.get(d, (0, 0))
+        if self.is_connected:
+            tilt_sign = self._get_tilt_sign()
+            if p_spd != 0:
+                self.comm.pan_set_speed(p_spd)
+            if t_spd != 0:
+                self.comm.tilt_set_speed(t_spd * tilt_sign)
+        self.sim_pan_spd = p_spd
+        self.sim_tilt_spd = t_spd
+        self._log(f"[DPAD] {d} → PAN={p_spd:.0f} TILT={t_spd:.0f} °/s")
+
+    def _on_dpad_released(self, d):
+        if d == 'STOP':
+            return
+        if d in ('UP_RIGHT', 'UP_LEFT', 'DOWN_RIGHT', 'DOWN_LEFT'):
+            if self.is_connected:
+                self.comm.pan_stop()
+                self.comm.tilt_stop()
+            self.sim_pan_spd = 0
+            self.sim_tilt_spd = 0
+            self._log(f"[DPAD] {d} → ALL STOP")
+        elif d in ('LEFT', 'RIGHT'):
+            if self.is_connected:
+                self.comm.pan_stop()
+            self.sim_pan_spd = 0
+            self._log("[DPAD] PAN STOP")
+        elif d in ('UP', 'DOWN'):
+            if self.is_connected:
+                self.comm.tilt_stop()
+            self.sim_tilt_spd = 0
+            self._log("[DPAD] TILT STOP")
+
+    # ════════════════ SIMULATION ════════════════
+    def _simulate(self):
+        if self.is_connected:
+            return
+        dt = 0.03
+        if abs(self.sim_pan_spd) > 0.01:
+            self.sim_pan = (self.sim_pan + self.sim_pan_spd * dt) % 360
+        if abs(self.sim_tilt_spd) > 0.01:
+            self.sim_tilt = max(-90, min(45, self.sim_tilt + self.sim_tilt_spd * dt))
+        self.pan_pos_lbl.setText(f"{self.sim_pan:.2f}°")
+        self.tilt_pos_lbl.setText(f"{self.sim_tilt:.2f}°")
+        self.pan_spd_lbl.setText(f"{self.sim_pan_spd:.1f} °/s")
+        self.tilt_spd_lbl.setText(f"{self.sim_tilt_spd:.1f} °/s")
+        self.temp_lbl.setText("25.0 °C")
+        moving = abs(self.sim_pan_spd) > 0.1 or abs(self.sim_tilt_spd) > 0.1
+        self.action_lbl.setText("MOVING" if moving else "IDLE")
+        self.action_lbl.setStyleSheet(
+            f"color:{COLOR_ACTIVE};font:600 11px 'SF Pro Display';" if moving
+            else "color:#f5f5f7;font:600 11px 'SF Pro Display';")
+
+    # ════════════════ LOG ════════════════
+    def _log(self, msg):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.log_text.appendPlainText(f"[{ts}] {msg}")
