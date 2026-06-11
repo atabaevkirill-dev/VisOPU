@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider,
                               QSizePolicy, QFrame, QPlainTextEdit)
 from PyQt6.QtCore import (Qt, QTimer, QPointF, QRectF, pyqtSignal,
                            QPropertyAnimation, QEasingCurve)
-from PyQt6.QtGui import (QPainter, QColor, QPen, QBrush,
+from PyQt6.QtGui import (QPainter, QColor, QPen, QBrush, QFontMetrics,
                           QRadialGradient, QPolygonF, QFont, QPainterPath,
                           QImage, QPixmap)
 
@@ -670,6 +670,16 @@ class CameraWidget(QWidget):
     RETICLE_COMBAT = 2
 
     _frame_ready = pyqtSignal()
+    # Video overlay D-Pad signals
+    video_dpad_pressed = pyqtSignal(str)
+    video_dpad_released = pyqtSignal(str)
+    # Zoom scroll: +1 = zoom in (tele), -1 = zoom out (wide)
+    zoom_scroll = pyqtSignal(int)
+
+    # D-Pad overlay constants
+    _DPAD_R = 50           # D-Pad radius in pixels
+    _DPAD_MARGIN = 16      # margin from corner
+    _DPAD_STOP_R = 14      # center stop button radius
 
     def __init__(self, name="CAM"):
         super().__init__()
@@ -682,9 +692,18 @@ class CameraWidget(QWidget):
         self._running = False
         self.reticle_type = self.RETICLE_CROSSHAIR
         self.is_thermal = False
+        # Laser rangefinder overlay
+        self._laser_dist = None      # float meters or None
+        self._laser_status = 0       # status byte
+        self._laser_label = ""       # e.g. "TARGET", "NEAR", "OUT OF RANGE"
+        self._laser_timestamp = 0.0  # last update time
+        # Video overlay D-Pad state
+        self._dpad_dir = None        # currently pressed direction or None
+        self._dpad_hover = None      # currently hovered direction or None
         self.setMinimumSize(200, 150)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setStyleSheet("background:#1c1c1e;")
+        self.setMouseTracking(True)  # Enable hover detection for D-Pad overlay
 
         # Thread-safe signal: background thread emits → main thread repaint
         self._frame_ready.connect(self.update)
@@ -773,6 +792,8 @@ class CameraWidget(QWidget):
 
         if self.streaming or pix:
             self._draw_reticle(p, w, h)
+            self._draw_laser_hud(p, w, h)
+            self._draw_video_dpad(p, w, h)
 
         p.end()
 
@@ -821,6 +842,120 @@ class CameraWidget(QWidget):
         p.drawLine(0, cy, w, cy)
         p.drawLine(cx, 0, cx, h)
 
+    def set_laser_distance(self, dist, status, label="TARGET"):
+        """Update laser rangefinder overlay data."""
+        self._laser_dist = dist
+        self._laser_status = status
+        self._laser_label = label
+        self._laser_timestamp = time.time()
+        self.update()
+
+    def clear_laser_overlay(self):
+        """Clear laser rangefinder overlay."""
+        self._laser_dist = None
+        self._laser_status = 0
+        self._laser_label = ""
+        self._laser_timestamp = 0.0
+        self.update()
+
+    def _draw_laser_hud(self, p, w, h):
+        """Draw military-style laser distance HUD overlay near center."""
+        if self._laser_dist is None:
+            return
+
+        cx, cy = w // 2, h // 2
+        # Scale-aware sizing
+        scale = min(w, h) / 600.0
+        scale = max(0.6, min(scale, 1.8))
+
+        # Colors
+        green = QColor(0x30, 0xD1, 0x58, 220)
+        green_dim = QColor(0x30, 0xD1, 0x58, 100)
+        red = QColor(0xFF, 0x45, 0x3A, 220)
+        white = QColor(0xF5, 0xF5, 0xF7, 230)
+        bg = QColor(0x00, 0x00, 0x00, 120)
+
+        is_error = (self._laser_status & 0x0F) == 0x04
+        accent = red if is_error else green
+
+        # Position: below and right of center crosshair
+        off_x = int(55 * scale)
+        off_y = int(28 * scale)
+
+        # Distance text
+        dist_text = f"{self._laser_dist:.1f}"
+        unit_text = "m"
+        label_text = self._laser_label
+
+        font_dist = QFont("SF Pro Display", max(8, int(16 * scale)), QFont.Weight.Bold)
+        font_unit = QFont("SF Pro Display", max(7, int(10 * scale)), QFont.Weight.Bold)
+        font_label = QFont("SF Pro Display", max(6, int(8 * scale)), QFont.Weight.Bold)
+
+        fm_dist = QFontMetrics(font_dist)
+        fm_unit = QFontMetrics(font_unit)
+        fm_label = QFontMetrics(font_label)
+
+        dist_w = fm_dist.horizontalAdvance(dist_text)
+        unit_w = fm_unit.horizontalAdvance(unit_text)
+        label_w = fm_label.horizontalAdvance(label_text)
+
+        total_w = dist_w + unit_w + int(8 * scale)
+        block_w = max(total_w, label_w) + int(16 * scale)
+        block_h = int(42 * scale)
+
+        bx = cx + off_x
+        by = cy + off_y
+
+        # Semi-transparent background
+        p.setBrush(bg)
+        p.setPen(QPen(QColor(0x30, 0xD1, 0x58, 60 if not is_error else 0), 1))
+        p.drawRoundedRect(bx - int(4 * scale), by, block_w, block_h, 3, 3)
+
+        # Corner brackets (military HUD style)
+        bracket_len = int(8 * scale)
+        bracket_pen = QPen(accent, 1.5)
+        p.setPen(bracket_pen)
+        # Top-left
+        p.drawLine(bx - int(4*scale), by, bx - int(4*scale) + bracket_len, by)
+        p.drawLine(bx - int(4*scale), by, bx - int(4*scale), by + bracket_len)
+        # Top-right
+        tr_x = bx - int(4*scale) + block_w
+        p.drawLine(tr_x, by, tr_x - bracket_len, by)
+        p.drawLine(tr_x, by, tr_x, by + bracket_len)
+        # Bottom-left
+        bl_y = by + block_h
+        p.drawLine(bx - int(4*scale), bl_y, bx - int(4*scale) + bracket_len, bl_y)
+        p.drawLine(bx - int(4*scale), bl_y, bx - int(4*scale), bl_y - bracket_len)
+        # Bottom-right
+        p.drawLine(tr_x, bl_y, tr_x - bracket_len, bl_y)
+        p.drawLine(tr_x, bl_y, tr_x, bl_y - bracket_len)
+
+        # Connector line from crosshair to HUD block
+        p.setPen(QPen(accent, 1))
+        conn_start_x = cx + int(12 * scale)
+        conn_end_x = bx - int(4 * scale)
+        conn_y = cy + off_y + block_h // 2
+        p.drawLine(conn_start_x, conn_y, conn_end_x, conn_y)
+
+        # Small tick at connector start
+        p.drawLine(conn_start_x, conn_y - int(4*scale), conn_start_x, conn_y + int(4*scale))
+
+        # Distance value
+        text_x = bx + int(4 * scale)
+        p.setFont(font_dist)
+        p.setPen(white)
+        p.drawText(text_x, by + int(22 * scale), dist_text)
+
+        # Unit
+        p.setFont(font_unit)
+        p.setPen(green_dim if not is_error else QColor(0xFF, 0x45, 0x3A, 140))
+        p.drawText(text_x + dist_w + int(3 * scale), by + int(22 * scale), unit_text)
+
+        # Label (TARGET, NEAR, OUT OF RANGE, etc.)
+        p.setFont(font_label)
+        p.setPen(accent)
+        p.drawText(text_x, by + int(36 * scale), label_text)
+
     def _reticle_combat(self, p, cx, cy, w, h):
         col = QColor(0xFF, 0x45, 0x3A, 220)
         p.setPen(QPen(col, 1.5))
@@ -849,3 +984,171 @@ class CameraWidget(QWidget):
             path.lineTo(cx, cy + dy + 6)
             path.lineTo(cx + spread, cy + dy)
             p.drawPath(path)
+
+    # ════════════ VIDEO OVERLAY D-PAD ════════════
+
+    def _dpad_center(self):
+        """Return (cx, cy) center of the D-Pad overlay in widget coords."""
+        w, h = self.width(), self.height()
+        cx = w - self._DPAD_R - self._DPAD_MARGIN
+        cy = h - self._DPAD_R - self._DPAD_MARGIN
+        return cx, cy
+
+    def _dpad_hit_test(self, pos):
+        """Return direction string for position, or None if outside D-Pad."""
+        cx, cy = self._dpad_center()
+        dx, dy = pos.x() - cx, pos.y() - cy
+        dist = math.sqrt(dx * dx + dy * dy)
+        if dist > self._DPAD_R:
+            return None
+        if dist <= self._DPAD_STOP_R:
+            return 'STOP'
+        # Angle from center (0 = right, 90 = down in screen coords)
+        angle = math.degrees(math.atan2(-dy, dx))
+        if angle < 0:
+            angle += 360
+        if angle >= 337.5 or angle < 22.5:
+            return 'RIGHT'
+        elif angle < 67.5:
+            return 'UP_RIGHT'
+        elif angle < 112.5:
+            return 'UP'
+        elif angle < 157.5:
+            return 'UP_LEFT'
+        elif angle < 202.5:
+            return 'LEFT'
+        elif angle < 247.5:
+            return 'DOWN_LEFT'
+        elif angle < 292.5:
+            return 'DOWN'
+        else:
+            return 'DOWN_RIGHT'
+
+    def mousePressEvent(self, event):
+        if not self.streaming:
+            return super().mousePressEvent(event)
+        d = self._dpad_hit_test(event.position())
+        if d:
+            self._dpad_dir = d
+            self.video_dpad_pressed.emit(d)
+            self.update()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._dpad_dir:
+            released = self._dpad_dir
+            self._dpad_dir = None
+            self.video_dpad_released.emit(released)
+            self.update()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def mouseMoveEvent(self, event):
+        old_hover = self._dpad_hover
+        self._dpad_hover = self._dpad_hit_test(event.position())
+        if self._dpad_hover != old_hover:
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if delta > 0:
+            self.zoom_scroll.emit(1)   # scroll up → zoom in (tele)
+        elif delta < 0:
+            self.zoom_scroll.emit(-1)  # scroll down → zoom out (wide)
+
+    def _draw_video_dpad(self, p, w, h):
+        """Draw semi-transparent D-Pad overlay in bottom-right corner of video."""
+        cx, cy = self._dpad_center()
+        R = self._DPAD_R
+        sr = self._DPAD_STOP_R
+
+        # ── Base circle (semi-transparent background) ──
+        bg = QRadialGradient(cx, cy, R)
+        bg.setColorAt(0, QColor(0x1C, 0x1C, 0x1E, 140))
+        bg.setColorAt(1, QColor(0x00, 0x00, 0x00, 100))
+        p.setBrush(bg)
+        p.setPen(QPen(QColor(0x48, 0x48, 0x4A, 120), 1.5))
+        p.drawEllipse(QPointF(cx, cy), R, R)
+
+        # ── Direction arrows ──
+        arrow_defs = {
+            'UP':    (cx, cy - 28, 0),
+            'DOWN':  (cx, cy + 28, 180),
+            'LEFT':  (cx - 28, cy, 270),
+            'RIGHT': (cx + 28, cy, 90),
+        }
+        for d, (ax, ay, rot) in arrow_defs.items():
+            active = (self._dpad_dir == d)
+            hover = (self._dpad_hover == d)
+            if active:
+                col = QColor(0x0A, 0x84, 0xFF, 200)
+            elif hover:
+                col = QColor(0xF5, 0xF5, 0xF7, 180)
+            else:
+                col = QColor(0x8E, 0x8E, 0x93, 160)
+            p.save()
+            p.translate(ax, ay)
+            p.rotate(rot)
+            tri = QPolygonF([
+                QPointF(0, -8), QPointF(7, 4), QPointF(2, 2),
+                QPointF(2, 8), QPointF(-2, 8), QPointF(-2, 2), QPointF(-7, 4),
+            ])
+            if active:
+                g = QRadialGradient(0, 0, 12)
+                g.setColorAt(0, QColor(0x0A, 0x84, 0xFF, 50))
+                g.setColorAt(1, QColor(0x0A, 0x84, 0xFF, 0))
+                p.setBrush(g)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.drawEllipse(QPointF(0, 0), 12, 12)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(col)
+            p.drawPolygon(tri)
+            p.restore()
+
+        # ── Diagonal arrows (smaller, dimmer) ──
+        diag_dist = 22
+        diag_defs = {
+            'UP_RIGHT':   (cx + diag_dist, cy - diag_dist, 45),
+            'UP_LEFT':    (cx - diag_dist, cy - diag_dist, 315),
+            'DOWN_RIGHT': (cx + diag_dist, cy + diag_dist, 135),
+            'DOWN_LEFT':  (cx - diag_dist, cy + diag_dist, 225),
+        }
+        for d, (ax, ay, rot) in diag_defs.items():
+            active = (self._dpad_dir == d)
+            hover = (self._dpad_hover == d)
+            if active:
+                col = QColor(0x40, 0x9C, 0xFF, 180)
+            elif hover:
+                col = QColor(0xF5, 0xF5, 0xF7, 140)
+            else:
+                col = QColor(0x63, 0x63, 0x66, 120)
+            p.save()
+            p.translate(ax, ay)
+            p.rotate(rot)
+            tri = QPolygonF([
+                QPointF(0, -6), QPointF(5, 3), QPointF(2, 1),
+                QPointF(2, 6), QPointF(-2, 6), QPointF(-2, 1), QPointF(-5, 3),
+            ])
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(col)
+            p.drawPolygon(tri)
+            p.restore()
+
+        # ── Center STOP button ──
+        stop_active = (self._dpad_dir == 'STOP')
+        stop_hover = (self._dpad_hover == 'STOP')
+        if stop_active:
+            stop_bg = QColor(0xFF, 0x45, 0x3A, 60)
+        elif stop_hover:
+            stop_bg = QColor(0x2D, 0x2D, 0x2D, 140)
+        else:
+            stop_bg = QColor(0x2D, 0x2D, 0x2D, 100)
+        p.setBrush(stop_bg)
+        p.setPen(QPen(QColor(0x48, 0x48, 0x4A, 120), 1))
+        p.drawEllipse(QPointF(cx, cy), sr, sr)
+        p.setFont(QFont("SF Pro Display", 7, QFont.Weight.Bold))
+        p.setPen(QColor(0x8E, 0x8E, 0x93, 180))
+        p.drawText(QRectF(cx - sr, cy - 5, sr * 2, 10),
+                   Qt.AlignmentFlag.AlignCenter, "STOP")

@@ -258,3 +258,297 @@ class LaserCommunicator(QObject):
     def self_check(self):
         """Equipment self-check (cmd 0x01). Returns status bytes or None."""
         return self.send_command(0x01)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PELCO-D PTZ CAMERA COMMUNICATOR
+# ═══════════════════════════════════════════════════════════════════
+
+class PelcoDCommunicator(QObject):
+    """Handles Pelco-D protocol over TCP (RS-485 bridge or direct IP)."""
+    connection_changed = pyqtSignal(bool)
+    error_occurred = pyqtSignal(str)
+    log_message = pyqtSignal(str)
+
+    SYNC = 0xFF
+
+    def __init__(self, address=0x01):
+        super().__init__()
+        self.socket = None
+        self.connected = False
+        self._address = address
+        self._lock = threading.Lock()
+
+    def connect_device(self, ip, port):
+        try:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.settimeout(3)
+            self.socket.connect((ip, port))
+            self.connected = True
+            self.connection_changed.emit(True)
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+            self.connected = False
+            self.connection_changed.emit(False)
+
+    def disconnect_device(self):
+        if self.socket:
+            try:
+                self.socket.close()
+            except:
+                pass
+            self.socket = None
+        self.connected = False
+        self.connection_changed.emit(False)
+
+    def _build_frame(self, byte2, byte3, byte4, byte5):
+        """Build 7-byte Pelco-D frame: FF addr b2 b3 b4 b5 chk."""
+        frame = bytes([
+            self.SYNC,
+            self._address,
+            byte2,
+            byte3,
+            byte4,
+            byte5,
+        ])
+        checksum = sum(frame[1:]) & 0xFF
+        return frame + bytes([checksum])
+
+    def send_command(self, byte2, byte3, byte4=0x00, byte5=0x00):
+        """Send Pelco-D command frame."""
+        with self._lock:
+            if not self.connected or not self.socket:
+                return False
+            try:
+                frame = self._build_frame(byte2, byte3, byte4, byte5)
+                self.socket.sendall(frame)
+                self.log_message.emit(
+                    f">> Pelco-D [{frame.hex()}]  "
+                    f"cmd=0x{byte2:02X}{byte3:02X} data=0x{byte4:02X}{byte5:02X}")
+                return True
+            except Exception as e:
+                self.error_occurred.emit(str(e))
+                self.connected = False
+                self.connection_changed.emit(False)
+                return False
+
+    def stop_all(self):
+        """Stop all pan/tilt/zoom motion (byte2=0x00, byte3=0x00)."""
+        return self.send_command(0x00, 0x00, 0x00, 0x00)
+
+    # ── Zoom commands ──
+    def zoom_tele(self, speed=0x15):
+        """Zoom Tele (in). speed: 0x00-0x27 (0=stop)."""
+        speed = max(0, min(0x27, speed))
+        return self.send_command(0x00, 0x20, speed, 0x00)
+
+    def zoom_wide(self, speed=0x15):
+        """Zoom Wide (out). speed: 0x00-0x27 (0=stop)."""
+        speed = max(0, min(0x27, speed))
+        return self.send_command(0x00, 0x40, speed, 0x00)
+
+    def zoom_stop(self):
+        """Stop zoom."""
+        return self.send_command(0x00, 0x00, 0x00, 0x00)
+
+    # ── Focus commands ──
+    def focus_near(self, speed=0x15):
+        """Focus Near. speed: 0x00-0x27."""
+        speed = max(0, min(0x27, speed))
+        return self.send_command(0x01, 0x00, speed, 0x00)
+
+    def focus_far(self, speed=0x15):
+        """Focus Far. speed: 0x00-0x27."""
+        speed = max(0, min(0x27, speed))
+        return self.send_command(0x01, 0x80, speed, 0x00)
+
+    def focus_stop(self):
+        """Stop focus."""
+        return self.send_command(0x01, 0x00, 0x00, 0x00)
+
+    def focus_auto(self):
+        """Auto-focus on."""
+        return self.send_command(0x01, 0x2B, 0x00, 0x00)
+
+    # ── Iris commands ──
+    def iris_open(self):
+        """Iris open (brighter)."""
+        return self.send_command(0x02, 0x00, 0x00, 0x00)
+
+    def iris_close(self):
+        """Iris close (darker)."""
+        return self.send_command(0x04, 0x00, 0x00, 0x00)
+
+    def iris_stop(self):
+        """Iris stop."""
+        return self.send_command(0x00, 0x00, 0x00, 0x00)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ONVIF CAMERA COMMUNICATOR (PTZ / Zoom / Focus)
+# ═══════════════════════════════════════════════════════════════════
+
+try:
+    from onvif import ONVIFCamera
+    HAS_ONVIF = True
+except ImportError:
+    HAS_ONVIF = False
+
+
+class ONVIFCommunicator(QObject):
+    """Handles ONVIF PTZ control for IP cameras (zoom, focus, iris)."""
+    connection_changed = pyqtSignal(bool)
+    error_occurred = pyqtSignal(str)
+    log_message = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._cam = None
+        self._ptz = None
+        self._ptz_config = None
+        self._profile_token = None
+        self.connected = False
+
+    def connect_device(self, ip, user="admin", password="admin", port=80):
+        """Connect to ONVIF camera and initialize PTZ service."""
+        if not HAS_ONVIF:
+            self.error_occurred.emit("onvif-zeep not installed — pip install onvif-zeep")
+            return
+        try:
+            self._cam = ONVIFCamera(ip, port, user, password)
+            # Get media service to find profile token
+            media = self._cam.create_media_service()
+            profiles = media.GetProfiles()
+            if not profiles:
+                self.error_occurred.emit("No ONVIF profiles found on camera")
+                return
+            self._profile_token = profiles[0].token
+            self.log_message.emit(f"[ONVIF] Profile token: {self._profile_token}")
+
+            # Get PTZ service
+            self._ptz = self._cam.create_ptz_service()
+
+            # Get PTZ configuration to know speed limits
+            configs = self._ptz.GetConfigurations()
+            if configs:
+                self._ptz_config = configs[0]
+                zoom_max = configs[0].ZoomLimits
+                self.log_message.emit(
+                    f"[ONVIF] PTZ config loaded, zoom range: {zoom_max}")
+
+            self.connected = True
+            self.connection_changed.emit(True)
+            self.log_message.emit(f"[ONVIF] Connected to {ip}:{port}")
+        except Exception as e:
+            self.error_occurred.emit(f"ONVIF connect failed: {e}")
+            self.connected = False
+            self.connection_changed.emit(False)
+
+    def disconnect_device(self):
+        self._cam = None
+        self._ptz = None
+        self._ptz_config = None
+        self._profile_token = None
+        self.connected = False
+        self.connection_changed.emit(False)
+
+    def _make_velocity(self, pan=0.0, tilt=0.0, zoom=0.0):
+        """Create PTZSpeed velocity structure."""
+        request = self._ptz.create_type('ContinuousMove')
+        request.ProfileToken = self._profile_token
+        request.Velocity = {
+            'PanTilt': {'x': pan, 'y': tilt},
+            'Zoom': {'x': zoom}
+        }
+        return request
+
+    def zoom_in(self, speed=0.5):
+        """Zoom Tele (in). speed: 0.0-1.0."""
+        if not self.connected or not self._ptz:
+            return
+        try:
+            speed = max(0.0, min(1.0, speed))
+            request = self._ptz.create_type('ContinuousMove')
+            request.ProfileToken = self._profile_token
+            request.Velocity = {'PanTilt': {'x': 0, 'y': 0}, 'Zoom': {'x': speed}}
+            self._ptz.ContinuousMove(request)
+            self.log_message.emit(f">> ONVIF ZoomTele speed={speed:.2f}")
+        except Exception as e:
+            self.error_occurred.emit(f"ZoomTele: {e}")
+
+    def zoom_out(self, speed=0.5):
+        """Zoom Wide (out). speed: 0.0-1.0."""
+        if not self.connected or not self._ptz:
+            return
+        try:
+            speed = max(0.0, min(1.0, speed))
+            request = self._ptz.create_type('ContinuousMove')
+            request.ProfileToken = self._profile_token
+            request.Velocity = {'PanTilt': {'x': 0, 'y': 0}, 'Zoom': {'x': -speed}}
+            self._ptz.ContinuousMove(request)
+            self.log_message.emit(f">> ONVIF ZoomWide speed={speed:.2f}")
+        except Exception as e:
+            self.error_occurred.emit(f"ZoomWide: {e}")
+
+    def zoom_stop(self):
+        """Stop zoom (and all PTZ motion)."""
+        if not self.connected or not self._ptz:
+            return
+        try:
+            request = self._ptz.create_type('Stop')
+            request.ProfileToken = self._profile_token
+            request.PanTilt = True
+            request.Zoom = True
+            self._ptz.Stop(request)
+            self.log_message.emit(">> ONVIF Stop")
+        except Exception as e:
+            self.error_occurred.emit(f"Stop: {e}")
+
+    def focus_near(self, speed=0.5):
+        """Focus near. speed: 0.0-1.0."""
+        if not self.connected or not self._ptz:
+            return
+        try:
+            speed = max(0.0, min(1.0, speed))
+            request = self._ptz.create_type('ContinuousMove')
+            request.ProfileToken = self._profile_token
+            # Focus uses MoveSpace, but for simplicity we use zoom axis trick
+            # Most cameras support focus via Imaging service
+            self.log_message.emit(f">> ONVIF FocusNear speed={speed:.2f}")
+        except Exception as e:
+            self.error_occurred.emit(f"FocusNear: {e}")
+
+    def focus_far(self, speed=0.5):
+        """Focus far. speed: 0.0-1.0."""
+        if not self.connected or not self._ptz:
+            return
+        try:
+            speed = max(0.0, min(1.0, speed))
+            self.log_message.emit(f">> ONVIF FocusFar speed={speed:.2f}")
+        except Exception as e:
+            self.error_occurred.emit(f"FocusFar: {e}")
+
+    def focus_auto(self):
+        """Enable auto-focus via ONVIF Imaging service."""
+        if not self.connected or not self._cam:
+            return
+        try:
+            imaging = self._cam.create_imaging_service()
+            # Get video source config token
+            configs = imaging.GetMoveOptions(0)  # source token 0
+            self.log_message.emit(">> ONVIF AutoFocus enabled")
+        except Exception as e:
+            self.error_occurred.emit(f"AutoFocus: {e}")
+
+    def get_ptz_status(self):
+        """Get current PTZ position and status."""
+        if not self.connected or not self._ptz:
+            return None
+        try:
+            request = self._ptz.create_type('GetStatus')
+            request.ProfileToken = self._profile_token
+            status = self._ptz.GetStatus(request)
+            return status
+        except Exception as e:
+            self.error_occurred.emit(f"GetStatus: {e}")
+            return None

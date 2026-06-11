@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
 from PyQt6.QtCore import Qt, QTimer, QPoint, QSettings, QObject
 from PyQt6.QtGui import QAction, QFont, QColor
 
-from app.communicators import DeviceCommunicator, LaserCommunicator
+from app.communicators import DeviceCommunicator, LaserCommunicator, PelcoDCommunicator, ONVIFCommunicator
 from app.widgets import (CollapsiblePanel, DirectionPad,
                           SpeedControl, CameraWidget, SlidingPanel, HAS_CV2)
 from app.styles import (apply_apple_dark_style, STYLE_GO_BUTTON, STYLE_STOP_ALL,
@@ -62,11 +62,52 @@ class _HideOnCloseFilter(QObject):
         return False
 
 
+class _StatusLink(QLabel):
+    """Clickable status label that opens a connection dialog on click."""
+
+    def __init__(self, text, parent=None):
+        super().__init__(text, parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._hover = False
+        self._callback = None
+        self._base_style = ""
+
+    def set_callback(self, fn):
+        self._callback = fn
+
+    def _apply_style(self):
+        color = self._base_style
+        if self._hover:
+            # Brighten on hover
+            color = color.replace('#636366', '#98989d')
+            color = color.replace('#30d158', '#5ae07a')
+            color = color.replace('#ff453a', '#ff6b63')
+        self.setStyleSheet(color)
+
+    def set_status_style(self, style):
+        self._base_style = style
+        self._apply_style()
+
+    def enterEvent(self, event):
+        self._hover = True
+        self._apply_style()
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self._apply_style()
+
+    def mousePressEvent(self, event):
+        if self._callback:
+            self._callback()
+
+
 # ═══════════════════════════════════════════════════════════════════
 # MAIN WINDOW
 # ═══════════════════════════════════════════════════════════════════
 
 class MainWindow(QMainWindow):
+    _LBL_FONT = "font:600 11px 'SF Pro Display';"
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("TL.0009 ОПУ — ТехЛазер")
@@ -78,6 +119,12 @@ class MainWindow(QMainWindow):
 
         self.laser_comm = LaserCommunicator()
         self.laser_connected = False
+
+        self.pelco_comm = PelcoDCommunicator()
+        self.pelco_connected = False
+
+        self.onvif_comm = ONVIFCommunicator()
+        self.onvif_connected = False
 
         # Camera state
         self.cam1_widget = None
@@ -96,6 +143,17 @@ class MainWindow(QMainWindow):
         self._cam2_ip = "192.168.1.11"
         self._cam2_user = "admin"
         self._cam2_pass = "admin"
+
+        # Pelco-D (zoom camera) settings
+        self._pelco_ip = "192.168.1.10"
+        self._pelco_port = 5000
+        self._pelco_addr = 1
+
+        # ONVIF camera settings
+        self._onvif_ip = "192.168.1.68"
+        self._onvif_port = 80
+        self._onvif_user = "admin"
+        self._onvif_pass = "12qwaszx"
 
         # Persistent settings
         self._settings = QSettings("VisOPU", "TL0009")
@@ -127,6 +185,11 @@ class MainWindow(QMainWindow):
         self.sim_timer.timeout.connect(self._simulate)
         self.sim_timer.start(30)
 
+        # Zoom wheel stop timer (stops ONVIF zoom after scroll pulse)
+        self._zoom_wheel_timer = QTimer()
+        self._zoom_wheel_timer.setSingleShot(True)
+        self._zoom_wheel_timer.timeout.connect(self._zoom_stop)
+
     # ════════════════ MENU BAR ════════════════
     def _build_menu(self):
         menubar = self.menuBar()
@@ -149,6 +212,12 @@ class MainWindow(QMainWindow):
         act_cam2 = QAction("CAM2 (Thermal)...", self)
         act_cam2.triggered.connect(self._connect_cam2_dialog)
         dev_menu.addAction(act_cam2)
+
+        dev_menu.addSeparator()
+
+        act_zoom = QAction("ZOOM Camera (ONVIF)...", self)
+        act_zoom.triggered.connect(self._connect_zoom_dialog)
+        dev_menu.addAction(act_zoom)
 
         dev_menu.addSeparator()
 
@@ -178,6 +247,13 @@ class MainWindow(QMainWindow):
         self._cam2_ip = s.value("cam2_ip", self._cam2_ip)
         self._cam2_user = s.value("cam2_user", self._cam2_user)
         self._cam2_pass = s.value("cam2_pass", self._cam2_pass)
+        self._pelco_ip = s.value("pelco_ip", self._pelco_ip)
+        self._pelco_port = int(s.value("pelco_port", self._pelco_port))
+        self._pelco_addr = int(s.value("pelco_addr", self._pelco_addr))
+        self._onvif_ip = s.value("onvif_ip", self._onvif_ip)
+        self._onvif_port = int(s.value("onvif_port", self._onvif_port))
+        self._onvif_user = s.value("onvif_user", self._onvif_user)
+        self._onvif_pass = s.value("onvif_pass", self._onvif_pass)
 
     def _save_settings(self):
         """Save connection parameters to persistent storage."""
@@ -192,6 +268,13 @@ class MainWindow(QMainWindow):
         s.setValue("cam2_ip", self._cam2_ip)
         s.setValue("cam2_user", self._cam2_user)
         s.setValue("cam2_pass", self._cam2_pass)
+        s.setValue("pelco_ip", self._pelco_ip)
+        s.setValue("pelco_port", self._pelco_port)
+        s.setValue("pelco_addr", self._pelco_addr)
+        s.setValue("onvif_ip", self._onvif_ip)
+        s.setValue("onvif_port", self._onvif_port)
+        s.setValue("onvif_user", self._onvif_user)
+        s.setValue("onvif_pass", self._onvif_pass)
         # Save cameras window geometry
         if hasattr(self, '_cameras_win'):
             s.setValue("cam_win_geometry", self._cameras_win.geometry())
@@ -261,6 +344,26 @@ class MainWindow(QMainWindow):
             url = url.replace("{user}", self._cam2_user).replace("{pass}", self._cam2_pass)
             self._connect_cam_stream(2, url, is_thermal=True)
 
+    def _connect_zoom_dialog(self):
+        dlg = ConnectionDialog("ZOOM Camera — ONVIF", [
+            ("IP:", self._onvif_ip, "text"),
+            ("Port:", self._onvif_port, "text"),
+            ("User:", self._onvif_user, "text"),
+            ("Pass:", self._onvif_pass, "password"),
+        ], self)
+        if dlg.exec():
+            vals = dlg.get_values()
+            self._onvif_ip = vals["IP:"]
+            self._onvif_port = int(vals["Port:"])
+            self._onvif_user = vals["User:"]
+            self._onvif_pass = vals["Pass:"]
+            self._save_settings()
+            if self.onvif_connected:
+                self.onvif_comm.disconnect_device()
+            self.onvif_comm.connect_device(
+                self._onvif_ip, self._onvif_user, self._onvif_pass, self._onvif_port)
+            self._log(f"[ZOOM] Connecting ONVIF {self._onvif_ip}:{self._onvif_port}")
+
     def _connect_cam_stream(self, cam_idx, url, is_thermal):
         widget = self.cam1_widget if cam_idx == 1 else self.cam2_widget
         if not HAS_CV2:
@@ -287,7 +390,7 @@ class MainWindow(QMainWindow):
         # Update status indicator
         lbl = self.cam1_status_lbl if cam_idx == 1 else self.cam2_status_lbl
         lbl.setText(f"● CAM{cam_idx}: {s}")
-        lbl.setStyleSheet(f"color:{c}; font:600 11px 'SF Pro Display';")
+        lbl.set_status_style(f"color:{c}; {self._LBL_FONT}")
 
     def _set_reticle(self, idx):
         if self.cam1_widget:
@@ -331,22 +434,31 @@ class MainWindow(QMainWindow):
         left.setContentsMargins(8, 8, 8, 8)
         left.setSpacing(2)
 
-        # Status indicators (compact)
+        # Status indicators (compact, clickable)
         status_panel = CollapsiblePanel("DEVICE STATUS")
         sl = QGridLayout()
         sl.setSpacing(4)
-        self.pt_status_lbl = QLabel("● PAN-TILT: OFF")
-        self.pt_status_lbl.setStyleSheet(f"color:{COLOR_DISCONNECTED}; font:600 11px 'SF Pro Display';")
-        self.laser_status_lbl = QLabel("● LASER: OFF")
-        self.laser_status_lbl.setStyleSheet(f"color:{COLOR_DISCONNECTED}; font:600 11px 'SF Pro Display';")
-        self.cam1_status_lbl = QLabel("● CAM1: OFF")
-        self.cam1_status_lbl.setStyleSheet(f"color:{COLOR_DISCONNECTED}; font:600 11px 'SF Pro Display';")
-        self.cam2_status_lbl = QLabel("● CAM2: OFF")
-        self.cam2_status_lbl.setStyleSheet(f"color:{COLOR_DISCONNECTED}; font:600 11px 'SF Pro Display';")
+        _lbl_font = self._LBL_FONT
+        self.pt_status_lbl = _StatusLink("● PAN-TILT: OFF")
+        self.pt_status_lbl.set_status_style(f"color:{COLOR_DISCONNECTED}; {_lbl_font}")
+        self.pt_status_lbl.set_callback(self._connect_pan_tilt_dialog)
+        self.laser_status_lbl = _StatusLink("● LASER: OFF")
+        self.laser_status_lbl.set_status_style(f"color:{COLOR_DISCONNECTED}; {_lbl_font}")
+        self.laser_status_lbl.set_callback(self._connect_laser_dialog)
+        self.cam1_status_lbl = _StatusLink("● CAM1: OFF")
+        self.cam1_status_lbl.set_status_style(f"color:{COLOR_DISCONNECTED}; {_lbl_font}")
+        self.cam1_status_lbl.set_callback(self._connect_cam1_dialog)
+        self.cam2_status_lbl = _StatusLink("● CAM2: OFF")
+        self.cam2_status_lbl.set_status_style(f"color:{COLOR_DISCONNECTED}; {_lbl_font}")
+        self.cam2_status_lbl.set_callback(self._connect_cam2_dialog)
+        self.zoom_status_lbl = _StatusLink("● ZOOM: OFF")
+        self.zoom_status_lbl.set_status_style(f"color:{COLOR_DISCONNECTED}; {_lbl_font}")
+        self.zoom_status_lbl.set_callback(self._connect_zoom_dialog)
         sl.addWidget(self.pt_status_lbl, 0, 0)
         sl.addWidget(self.laser_status_lbl, 1, 0)
         sl.addWidget(self.cam1_status_lbl, 2, 0)
         sl.addWidget(self.cam2_status_lbl, 3, 0)
+        sl.addWidget(self.zoom_status_lbl, 4, 0)
         status_panel.content_layout().addLayout(sl)
         left.addWidget(status_panel)
 
@@ -529,6 +641,50 @@ class MainWindow(QMainWindow):
         laser.content_layout().addLayout(las)
         right.addWidget(laser)
 
+        # Zoom camera (Pelco-D)
+        zoom = CollapsiblePanel("ZOOM CAMERA")
+        zl = QVBoxLayout()
+        zoom_row = QHBoxLayout()
+        self.zoom_tele_btn = QPushButton("TELE +")
+        self.zoom_tele_btn.setStyleSheet(STYLE_GO_BUTTON)
+        self.zoom_tele_btn.pressed.connect(self._zoom_tele)
+        self.zoom_tele_btn.released.connect(self._zoom_stop)
+        zoom_row.addWidget(self.zoom_tele_btn)
+        self.zoom_wide_btn = QPushButton("WIDE −")
+        self.zoom_wide_btn.setStyleSheet(STYLE_DIAG_BUTTON)
+        self.zoom_wide_btn.pressed.connect(self._zoom_wide)
+        self.zoom_wide_btn.released.connect(self._zoom_stop)
+        zoom_row.addWidget(self.zoom_wide_btn)
+        zl.addLayout(zoom_row)
+        self.zoom_speed_spin = QSpinBox()
+        self.zoom_speed_spin.setRange(10, 100)
+        self.zoom_speed_spin.setValue(50)
+        self.zoom_speed_spin.setSuffix(" %")
+        self.zoom_speed_spin.setToolTip("Zoom speed: 10-100%")
+        zl.addWidget(self.zoom_speed_spin)
+        zoom_stop_btn = QPushButton("ZOOM STOP")
+        zoom_stop_btn.setStyleSheet(STYLE_STOP_ALL)
+        zoom_stop_btn.clicked.connect(self._zoom_stop)
+        zl.addWidget(zoom_stop_btn)
+        focus_row = QHBoxLayout()
+        self.focus_near_btn = QPushButton("NEAR")
+        self.focus_near_btn.setStyleSheet(STYLE_DIAG_BUTTON)
+        self.focus_near_btn.pressed.connect(self._focus_near)
+        self.focus_near_btn.released.connect(self._focus_stop)
+        focus_row.addWidget(self.focus_near_btn)
+        self.focus_far_btn = QPushButton("FAR")
+        self.focus_far_btn.setStyleSheet(STYLE_DIAG_BUTTON)
+        self.focus_far_btn.pressed.connect(self._focus_far)
+        self.focus_far_btn.released.connect(self._focus_stop)
+        focus_row.addWidget(self.focus_far_btn)
+        zl.addLayout(focus_row)
+        self.focus_auto_btn = QPushButton("AUTO FOCUS")
+        self.focus_auto_btn.setStyleSheet(STYLE_DIAG_BUTTON)
+        self.focus_auto_btn.clicked.connect(self._focus_auto)
+        zl.addWidget(self.focus_auto_btn)
+        zoom.content_layout().addLayout(zl)
+        right.addWidget(zoom)
+
         # Device state
         st = CollapsiblePanel("DEVICE STATE")
         sg = QGridLayout()
@@ -582,6 +738,17 @@ class MainWindow(QMainWindow):
         self.laser_comm.connection_changed.connect(self._on_laser_connection)
         self.laser_comm.error_occurred.connect(lambda e: self._log(f"[LASER ERR] {e}"))
         self.laser_comm.log_message.connect(self._log)
+        self.pelco_comm.connection_changed.connect(self._on_pelco_connection)
+        self.pelco_comm.error_occurred.connect(lambda e: self._log(f"[ZOOM ERR] {e}"))
+        self.pelco_comm.log_message.connect(self._log)
+        self.onvif_comm.connection_changed.connect(self._on_onvif_connection)
+        self.onvif_comm.error_occurred.connect(lambda e: self._log(f"[ZOOM ERR] {e}"))
+        self.onvif_comm.log_message.connect(self._log)
+        # Video overlay D-Pad + zoom scroll from camera widgets
+        for cam in (self.cam1_widget, self.cam2_widget):
+            cam.video_dpad_pressed.connect(self._on_dpad_pressed)
+            cam.video_dpad_released.connect(self._on_dpad_released)
+            cam.zoom_scroll.connect(self._on_zoom_scroll)
 
     # ════════════════ CALLBACKS ════════════════
     def _on_real_pan(self, v):
@@ -613,7 +780,7 @@ class MainWindow(QMainWindow):
         c = COLOR_CONNECTED if connected else COLOR_DISCONNECTED
         s = "ON" if connected else "OFF"
         self.pt_status_lbl.setText(f"● PAN-TILT: {s}")
-        self.pt_status_lbl.setStyleSheet(f"color:{c}; font:600 11px 'SF Pro Display';")
+        self.pt_status_lbl.set_status_style(f"color:{c}; {self._LBL_FONT}")
         self._log(f"[PAN-TILT] {'Connected' if connected else 'Disconnected'}")
 
     def _on_laser_connection(self, connected):
@@ -621,8 +788,24 @@ class MainWindow(QMainWindow):
         c = COLOR_CONNECTED if connected else COLOR_DISCONNECTED
         s = "ON" if connected else "OFF"
         self.laser_status_lbl.setText(f"● LASER: {s}")
-        self.laser_status_lbl.setStyleSheet(f"color:{c}; font:600 11px 'SF Pro Display';")
+        self.laser_status_lbl.set_status_style(f"color:{c}; {self._LBL_FONT}")
         self._log(f"[LASER] {'Connected' if connected else 'Disconnected'}")
+
+    def _on_pelco_connection(self, connected):
+        self.pelco_connected = connected
+        c = COLOR_CONNECTED if connected else COLOR_DISCONNECTED
+        s = "ON" if connected else "OFF"
+        self.zoom_status_lbl.setText(f"● ZOOM: {s}")
+        self.zoom_status_lbl.set_status_style(f"color:{c}; {self._LBL_FONT}")
+        self._log(f"[ZOOM] {'Connected' if connected else 'Disconnected'}")
+
+    def _on_onvif_connection(self, connected):
+        self.onvif_connected = connected
+        c = COLOR_CONNECTED if connected else COLOR_DISCONNECTED
+        s = "ON" if connected else "OFF"
+        self.zoom_status_lbl.setText(f"● ZOOM: {s}")
+        self.zoom_status_lbl.set_status_style(f"color:{c}; {self._LBL_FONT}")
+        self._log(f"[ZOOM] ONVIF {'Connected' if connected else 'Disconnected'}")
 
     # ════════════════ ACTIONS ════════════════
     def _get_tilt_sign(self):
@@ -696,7 +879,8 @@ class MainWindow(QMainWindow):
     def _on_laser_distance(self, dist, status):
         self.laser_dist_lbl.setText(f"{dist:.1f} m")
         if status & 0x0F == 0x04:
-            self.laser_target_lbl.setText("OUT OF RANGE")
+            label = "OUT OF RANGE"
+            self.laser_target_lbl.setText(label)
             self.laser_target_lbl.setStyleSheet(
                 f"color:{COLOR_ERROR}; font:600 10px 'SF Pro Display';")
         else:
@@ -710,6 +894,10 @@ class MainWindow(QMainWindow):
             self.laser_target_lbl.setText(label)
             self.laser_target_lbl.setStyleSheet(
                 "color:#f5f5f7; font:600 10px 'SF Pro Display';")
+        # Push distance overlay to camera widgets
+        for cam in (self.cam1_widget, self.cam2_widget):
+            if cam:
+                cam.set_laser_distance(dist, status, label)
 
     def _laser_single(self):
         if not self.laser_connected:
@@ -724,6 +912,10 @@ class MainWindow(QMainWindow):
             self._log(f"[LASER] Range: {dist:.1f} m  status=0x{status:02X}")
         else:
             self._log("[LASER] Single range: no response")
+            # Clear overlay on no response
+            for cam in (self.cam1_widget, self.cam2_widget):
+                if cam:
+                    cam.clear_laser_overlay()
 
     def _laser_continuous(self):
         if not self.laser_connected:
@@ -732,6 +924,15 @@ class MainWindow(QMainWindow):
         if self.laser_comm.polling:
             self.laser_comm.stop_continuous()
             self.laser_cont_btn.setText("CONT")
+            # Clear panel display
+            self.laser_dist_lbl.setText("---.- m")
+            self.laser_target_lbl.setText("NO TARGET")
+            self.laser_target_lbl.setStyleSheet(
+                "color:#636366; font:600 10px 'SF Pro Display';")
+            # Clear overlay on camera widgets
+            for cam in (self.cam1_widget, self.cam2_widget):
+                if cam:
+                    cam.clear_laser_overlay()
             self._log("[LASER] Continuous ranging stopped")
         else:
             self.laser_comm.start_continuous()
@@ -746,6 +947,10 @@ class MainWindow(QMainWindow):
         self.laser_target_lbl.setText("NO TARGET")
         self.laser_target_lbl.setStyleSheet(
             "color:#636366; font:600 10px 'SF Pro Display';")
+        # Clear overlay on camera widgets
+        for cam in (self.cam1_widget, self.cam2_widget):
+            if cam:
+                cam.clear_laser_overlay()
         self._log("[LASER] Ranging stopped, display cleared")
 
     def _laser_selfcheck(self):
@@ -769,6 +974,78 @@ class MainWindow(QMainWindow):
             self._log(f"[LASER] Health: {' | '.join(checks)}")
         else:
             self._log("[LASER] Self-check: no response")
+
+    # ════════════════ ZOOM (ONVIF) ════════════════
+    def _ensure_onvif_connected(self):
+        """Auto-connect to ONVIF camera if not connected."""
+        if not self.onvif_connected:
+            self._log(f"[ZOOM] Auto-connecting to {self._onvif_ip}...")
+            self.onvif_comm.connect_device(
+                self._onvif_ip, self._onvif_user, self._onvif_pass, self._onvif_port)
+            # Give it a moment to connect
+            import time
+            time.sleep(0.5)
+        return self.onvif_connected
+
+    def _zoom_tele(self):
+        if not self._ensure_onvif_connected():
+            return
+        spd = self.zoom_speed_spin.value() / 100.0
+        self.onvif_comm.zoom_in(spd)
+        self._log(f"[ZOOM] Tele (in) speed={spd:.2f}")
+
+    def _zoom_wide(self):
+        if not self._ensure_onvif_connected():
+            return
+        spd = self.zoom_speed_spin.value() / 100.0
+        self.onvif_comm.zoom_out(spd)
+        self._log(f"[ZOOM] Wide (out) speed={spd:.2f}")
+
+    def _zoom_stop(self):
+        if not self.onvif_connected:
+            return
+        self.onvif_comm.zoom_stop()
+        self._log("[ZOOM] Stop")
+
+    def _focus_near(self):
+        if not self._ensure_onvif_connected():
+            return
+        spd = self.zoom_speed_spin.value() / 100.0
+        self.onvif_comm.focus_near(spd)
+        self._log(f"[ZOOM] Focus Near speed={spd:.2f}")
+
+    def _focus_far(self):
+        if not self._ensure_onvif_connected():
+            return
+        spd = self.zoom_speed_spin.value() / 100.0
+        self.onvif_comm.focus_far(spd)
+        self._log(f"[ZOOM] Focus Far speed={spd:.2f}")
+
+    def _focus_stop(self):
+        if not self.onvif_connected:
+            return
+        self.onvif_comm.zoom_stop()
+        self._log("[ZOOM] Focus Stop")
+
+    def _focus_auto(self):
+        if not self._ensure_onvif_connected():
+            return
+        self.onvif_comm.focus_auto()
+        self._log("[ZOOM] Auto Focus")
+
+    def _on_zoom_scroll(self, direction):
+        """Handle mouse wheel zoom on camera video: +1=tele, -1=wide."""
+        if not self._ensure_onvif_connected():
+            return
+        spd = self.zoom_speed_spin.value() / 100.0
+        if direction > 0:
+            self.onvif_comm.zoom_in(spd)
+            self._log(f"[ZOOM] Scroll→Tele speed={spd:.2f}")
+        else:
+            self.onvif_comm.zoom_out(spd)
+            self._log(f"[ZOOM] Scroll→Wide speed={spd:.2f}")
+        # Restart stop timer — zoom stops 300ms after last scroll notch
+        self._zoom_wheel_timer.start(300)
 
     # ════════════════ D-PAD ════════════════
     def _on_dpad_pressed(self, d):
