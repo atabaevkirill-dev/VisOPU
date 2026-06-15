@@ -17,6 +17,8 @@ try:
 except ImportError:
     HAS_CV2 = False
 
+from app.detector import YoloDetector, Detection, AIR_CLASSES
+
 
 # ═══════════════════════════════════════════════════════════════════
 # COLLAPSIBLE PANEL
@@ -675,11 +677,29 @@ class CameraWidget(QWidget):
     video_dpad_released = pyqtSignal(str)
     # Zoom scroll: +1 = zoom in (tele), -1 = zoom out (wide)
     zoom_scroll = pyqtSignal(int)
+    # Detection target: (dx_norm, dy_norm, class_name) — offset from center -1..1
+    detection_target = pyqtSignal(float, float, str)
+    # Detection list updated — emits list of Detection objects
+    detections_updated = pyqtSignal(list)
+    # FPS counter
+    detection_fps = pyqtSignal(float)
+    # Video overlay button signals
+    video_laser_toggled = pyqtSignal(bool)
+    video_detect_toggled = pyqtSignal(bool)
+    video_track_toggled = pyqtSignal(bool)
+    video_filter_changed = pyqtSignal(str)
 
     # D-Pad overlay constants
     _DPAD_R = 50           # D-Pad radius in pixels
     _DPAD_MARGIN = 16      # margin from corner
     _DPAD_STOP_R = 14      # center stop button radius
+    # Detection frame-skip: run inference every N-th frame to keep video smooth
+    _DET_SKIP_FRAMES = 4
+    # Overlay action buttons (top-left)
+    _OBTN_X = 12; _OBTN_Y = 12; _OBTN_W = 56; _OBTN_H = 24; _OBTN_GAP = 4
+    # Video filter modes
+    FILTER_NORMAL = 0; FILTER_NVG = 1; FILTER_EDGE = 2; FILTER_BW = 3
+    _FILTER_NAMES = ('NORMAL', 'NVG', 'EDGE', 'BW')
 
     def __init__(self, name="CAM"):
         super().__init__()
@@ -700,6 +720,23 @@ class CameraWidget(QWidget):
         # Video overlay D-Pad state
         self._dpad_dir = None        # currently pressed direction or None
         self._dpad_hover = None      # currently hovered direction or None
+        # YOLO detection state
+        self._detector: YoloDetector = None
+        self._detections: list = []     # latest Detection objects
+        self._det_lock = threading.Lock()
+        self._tracking_target_id = None  # track_id to follow, None = no target
+        self._detect_active = False
+        self._det_frame_count = 0
+        self._det_fps_timer = time.time()
+        self._det_fps = 0.0
+        self._det_loop_count = 0        # frame counter for skip logic
+        # Video overlay button state
+        self._obtn_laser_on = False
+        self._obtn_detect_on = False
+        self._obtn_track_on = False
+        self._obtn_hover = None   # 'LASER', 'DETECT', 'TRACK', 'FILTER' or None
+        # Video filter mode
+        self._video_filter = self.FILTER_NORMAL
         self.setMinimumSize(200, 150)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setStyleSheet("background:#1c1c1e;")
@@ -755,7 +792,31 @@ class CameraWidget(QWidget):
         while self._running and self.cap and self.cap.isOpened():
             ret, frame = self.cap.read()
             if ret:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # Run detection/tracking on every N-th frame to keep video smooth
+                if self._detect_active and self._detector and self._detector.is_available:
+                    self._det_loop_count += 1
+                    if self._det_loop_count % self._DET_SKIP_FRAMES == 0:
+                        try:
+                            dets = self._detector.track(frame)
+                            with self._det_lock:
+                                self._detections = dets
+                            # Emit target offset for auto-follow
+                            self._emit_tracking_target(dets, frame.shape)
+                            # FPS counter
+                            self._det_frame_count += 1
+                            now = time.time()
+                            elapsed = now - self._det_fps_timer
+                            if elapsed >= 1.0:
+                                self._det_fps = self._det_frame_count / elapsed
+                                self._det_frame_count = 0
+                                self._det_fps_timer = now
+                                self.detection_fps.emit(self._det_fps)
+                            self.detections_updated.emit(dets)
+                        except Exception:
+                            pass
+                # Always update video frame (never blocked by detection)
+                filtered = self._apply_video_filter(frame)
+                rgb = cv2.cvtColor(filtered, cv2.COLOR_BGR2RGB)
                 h, w, ch = rgb.shape
                 qimg = QImage(rgb.data, w, h, w * ch, QImage.Format.Format_RGB888)
                 with self._frame_lock:
@@ -764,6 +825,118 @@ class CameraWidget(QWidget):
                 self._frame_ready.emit()
             else:
                 time.sleep(0.01)
+
+    def _emit_tracking_target(self, dets: list, frame_shape):
+        """Emit normalized offset of tracked target from frame center."""
+        if self._tracking_target_id is None:
+            return
+        h, w = frame_shape[:2]
+        cx, cy = w / 2.0, h / 2.0
+        for d in dets:
+            if d.track_id == self._tracking_target_id:
+                tx, ty = d.center
+                dx = (tx - cx) / cx  # -1..1
+                dy = (ty - cy) / cy  # -1..1
+                self.detection_target.emit(dx, dy, d.class_name)
+                return
+        # Target lost
+        self.detection_target.emit(0.0, 0.0, "")
+
+    def _apply_video_filter(self, frame):
+        """Apply selected military video filter to frame. Returns filtered BGR frame.
+        Optimized for real-time: in-place channel ops, no addWeighted, no full allocations."""
+        mode = self._video_filter
+        if mode == self.FILTER_NORMAL or not HAS_CV2:
+            return frame
+        try:
+            if mode == self.FILTER_NVG:
+                # Night vision: luminance → green channel, dim the rest
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                frame[:, :, 1] = gray          # green = full luminance
+                frame[:, :, 0] //= 4           # dim blue
+                frame[:, :, 2] //= 4           # dim red
+                return frame
+            elif mode == self.FILTER_EDGE:
+                # Tactical edge: Sobel gradient overlay (faster than Canny)
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gx = cv2.Sobel(gray, cv2.CV_8U, 1, 0, ksize=3)
+                gy = cv2.Sobel(gray, cv2.CV_8U, 0, 1, ksize=3)
+                edges = cv2.add(gx, gy)
+                # Blend edges into green channel for tactical look
+                frame[:, :, 1] = cv2.add(frame[:, :, 1], edges // 2)
+                return frame
+            elif mode == self.FILTER_BW:
+                # High-contrast B&W with histogram equalization
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                eq = cv2.equalizeHist(gray)
+                frame[:, :, 0] = eq
+                frame[:, :, 1] = eq
+                frame[:, :, 2] = eq
+                return frame
+        except Exception:
+            pass
+        return frame
+
+
+    # ── Detection control API ──
+
+    def enable_detection(self, detector: YoloDetector):
+        """Enable YOLO detection on this camera widget."""
+        self._detector = detector
+        self._detect_active = True
+        self._det_frame_count = 0
+        self._det_fps_timer = time.time()
+        self._det_fps = 0.0
+
+    def disable_detection(self):
+        """Disable YOLO detection."""
+        self._detect_active = False
+        with self._det_lock:
+            self._detections = []
+        self._tracking_target_id = None
+        self.update()
+
+    def select_track_target(self, track_id):
+        """Select a tracked object to follow. None to deselect."""
+        self._tracking_target_id = track_id
+
+    def get_tracked_targets(self) -> list:
+        """Return current detections with track IDs."""
+        with self._det_lock:
+            return [d for d in self._detections if d.track_id is not None]
+
+    def get_all_detections(self) -> list:
+        """Return all current detections."""
+        with self._det_lock:
+            return list(self._detections)
+
+    def is_detection_active(self) -> bool:
+        return self._detect_active and self._detector is not None
+
+    def get_detection_fps(self) -> float:
+        return self._det_fps
+
+    # ── Public sync API (called from MainWindow to keep overlay in sync) ──
+
+    def set_detect_state(self, on: bool):
+        """Sync DETECT overlay button state from external source."""
+        self._obtn_detect_on = on
+        self.update()
+
+    def set_track_state(self, on: bool):
+        """Sync TRACK overlay button state from external source."""
+        self._obtn_track_on = on
+        self.update()
+
+    def set_laser_state(self, on: bool):
+        """Sync LSR overlay button state from external source."""
+        self._obtn_laser_on = on
+        self.update()
+
+    def set_video_filter(self, mode: int):
+        """Set video filter mode (0=NORMAL, 1=NVG, 2=EDGE, 3=BW)."""
+        self._video_filter = mode
+        self.update()
 
     def set_reticle(self, rtype):
         self.reticle_type = rtype
@@ -792,8 +965,10 @@ class CameraWidget(QWidget):
 
         if self.streaming or pix:
             self._draw_reticle(p, w, h)
+            self._draw_detections(p, w, h)
             self._draw_laser_hud(p, w, h)
             self._draw_video_dpad(p, w, h)
+            self._draw_overlay_buttons(p, w, h)
 
         p.end()
 
@@ -985,6 +1160,150 @@ class CameraWidget(QWidget):
             path.lineTo(cx + spread, cy + dy)
             p.drawPath(path)
 
+    # ════════════ DETECTION OVERLAY ════════════
+
+    def _draw_detections(self, p, w, h):
+        """Military-grade HUD: corner brackets, velocity vectors, threat rings."""
+        with self._det_lock:
+            dets = list(self._detections)
+        if not dets:
+            return
+
+        # Video-to-widget coordinate transform
+        with self._frame_lock:
+            pix = self._pixmap
+        if not pix or pix.isNull():
+            return
+        vid_w, vid_h = pix.width(), pix.height()
+        scaled = min(w / vid_w, h / vid_h)
+        off_x = (w - vid_w * scaled) / 2.0
+        off_y = (h - vid_h * scaled) / 2.0
+
+        # Reticle center for threat assessment
+        rc_x, rc_y = w / 2.0, h / 2.0
+
+        # Sort: tracked target drawn last (on top)
+        dets_sorted = sorted(dets, key=lambda d: (d.track_id == self._tracking_target_id))
+
+        for det in dets_sorted:
+            x1, y1, x2, y2 = det.bbox
+            wx1 = off_x + x1 * scaled
+            wy1 = off_y + y1 * scaled
+            wx2 = off_x + x2 * scaled
+            wy2 = off_y + y2 * scaled
+            bw, bh = wx2 - wx1, wy2 - wy1
+            cx_d, cy_d = (wx1 + wx2) / 2, (wy1 + wy2) / 2
+
+            is_tracked = (det.track_id == self._tracking_target_id)
+            is_air = det.class_id in AIR_CLASSES
+
+            # ── Threat assessment: distance from reticle center ──
+            dist_center = ((cx_d - rc_x) ** 2 + (cy_d - rc_y) ** 2) ** 0.5
+            max_dist = ((w / 2) ** 2 + (h / 2) ** 2) ** 0.5
+            threat = 1.0 - min(dist_center / max_dist, 1.0)  # 0=far, 1=center
+
+            # ── Color by priority ──
+            if is_tracked:
+                color = QColor(0x00, 0xFF, 0x88, 230)     # bright green — locked
+            elif is_air:
+                color = QColor(0xFF, 0x6B, 0x00, 220)     # red-orange — air threat
+            elif threat > 0.7:
+                color = QColor(0xFF, 0x44, 0x44, 200)     # red — near reticle center
+            else:
+                color = QColor(0xF5, 0xF5, 0xF7, 130)     # white — standard
+
+            pen_w = 2.0 if is_tracked else 1.2
+
+            # ── Military corner brackets (no full rectangle) ──
+            b_len = max(6, min(18, min(bw, bh) * 0.18))
+            pen = QPen(color, pen_w)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            # Top-left
+            p.drawLine(QPointF(wx1, wy1), QPointF(wx1 + b_len, wy1))
+            p.drawLine(QPointF(wx1, wy1), QPointF(wx1, wy1 + b_len))
+            # Top-right
+            p.drawLine(QPointF(wx2, wy1), QPointF(wx2 - b_len, wy1))
+            p.drawLine(QPointF(wx2, wy1), QPointF(wx2, wy1 + b_len))
+            # Bottom-left
+            p.drawLine(QPointF(wx1, wy2), QPointF(wx1 + b_len, wy2))
+            p.drawLine(QPointF(wx1, wy2), QPointF(wx1, wy2 - b_len))
+            # Bottom-right
+            p.drawLine(QPointF(wx2, wy2), QPointF(wx2 - b_len, wy2))
+            p.drawLine(QPointF(wx2, wy2), QPointF(wx2, wy2 - b_len))
+
+            # ── Tracked target enhancements ──
+            if is_tracked:
+                # Tracking ring (dashed circle around target)
+                ring_r = max(bw, bh) * 0.65
+                p.setPen(QPen(QColor(0x00, 0xFF, 0x88, 100), 1.0, Qt.PenStyle.DashLine))
+                p.drawEllipse(QPointF(cx_d, cy_d), ring_r, ring_r)
+
+                # Velocity vector (arrow showing movement direction)
+                speed = det.speed
+                if speed > 1.5:  # only draw if meaningful movement
+                    v_scale = min(40, speed * 5)  # cap arrow length
+                    vx_n = det.vx / speed * v_scale
+                    vy_n = det.vy / speed * v_scale
+                    ax, ay = cx_d + vx_n, cy_d + vy_n
+                    p.setPen(QPen(QColor(0x00, 0xFF, 0x88, 180), 2.0))
+                    p.drawLine(QPointF(cx_d, cy_d), QPointF(ax, ay))
+                    # Arrow head
+                    angle = math.atan2(vy_n, vx_n)
+                    ah = 6  # arrow head length
+                    p.drawLine(QPointF(ax, ay),
+                              QPointF(ax - ah * math.cos(angle - 0.4),
+                                      ay - ah * math.sin(angle - 0.4)))
+                    p.drawLine(QPointF(ax, ay),
+                              QPointF(ax - ah * math.cos(angle + 0.4),
+                                      ay - ah * math.sin(angle + 0.4)))
+
+                # Center diamond marker
+                d_size = 3
+                p.setPen(QPen(QColor(0x00, 0xFF, 0x88, 255), 1.5))
+                diamond = QPolygonF([
+                    QPointF(cx_d, cy_d - d_size),
+                    QPointF(cx_d + d_size, cy_d),
+                    QPointF(cx_d, cy_d + d_size),
+                    QPointF(cx_d - d_size, cy_d),
+                    QPointF(cx_d, cy_d - d_size),
+                ])
+                p.drawPolyline(diamond)
+
+            # ── Air target designator (pulsing ring) ──
+            elif is_air and det.confidence >= 0.5:
+                pulse = 0.7 + 0.3 * math.sin(time.monotonic() * 4)
+                ring_r = max(bw, bh) * 0.55
+                p.setPen(QPen(QColor(0xFF, 0x6B, 0x00, int(120 * pulse)), 1.5))
+                p.drawEllipse(QPointF(cx_d, cy_d), ring_r, ring_r)
+
+            # ── Label ──
+            parts = []
+            if det.track_id is not None:
+                parts.append(f"T{det.track_id}")
+            parts.append(det.class_name.upper())
+            parts.append(f"{det.confidence:.0%}")
+            if is_tracked and det.speed > 1.5:
+                parts.append(f"{det.speed:.0f}px/f")
+            label = " ".join(parts)
+
+            font_size = max(7, int(8 * min(w, h) / 600))
+            font = QFont("SF Pro Display", font_size, QFont.Weight.Bold)
+            fm = QFontMetrics(font)
+            tw = fm.horizontalAdvance(label) + 8
+            th = fm.height() + 3
+
+            lx = wx1
+            ly = max(0, wy1 - th - 2)
+            p.setBrush(QColor(0x00, 0x00, 0x00, 170))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawRect(QRectF(lx, ly, tw, th))
+
+            p.setFont(font)
+            p.setPen(color)
+            p.drawText(QRectF(lx + 4, ly, tw - 4, th),
+                       Qt.AlignmentFlag.AlignVCenter, label)
+
     # ════════════ VIDEO OVERLAY D-PAD ════════════
 
     def _dpad_center(self):
@@ -1027,7 +1346,33 @@ class CameraWidget(QWidget):
     def mousePressEvent(self, event):
         if not self.streaming:
             return super().mousePressEvent(event)
-        d = self._dpad_hit_test(event.position())
+        pos = event.position()
+        w = self.width()
+        # Priority 1: overlay buttons (top-left)
+        btn = self._obtn_hit_test(pos, w)
+        if btn == 'LSR':
+            self._obtn_laser_on = not self._obtn_laser_on
+            self.video_laser_toggled.emit(self._obtn_laser_on)
+            self.update()
+            return
+        elif btn == 'DET':
+            self._obtn_detect_on = not self._obtn_detect_on
+            self.video_detect_toggled.emit(self._obtn_detect_on)
+            self.update()
+            return
+        elif btn == 'TRACK':
+            self._obtn_track_on = not self._obtn_track_on
+            self.video_track_toggled.emit(self._obtn_track_on)
+            self.update()
+            return
+        elif btn == 'FILTER':
+            # Cycle filter: NORMAL -> NVG -> EDGE -> BW -> NORMAL
+            self._video_filter = (self._video_filter + 1) % len(self._FILTER_NAMES)
+            self.video_filter_changed.emit(self._FILTER_NAMES[self._video_filter])
+            self.update()
+            return
+        # Priority 2: D-Pad (bottom-right)
+        d = self._dpad_hit_test(pos)
         if d:
             self._dpad_dir = d
             self.video_dpad_pressed.emit(d)
@@ -1048,6 +1393,12 @@ class CameraWidget(QWidget):
         old_hover = self._dpad_hover
         self._dpad_hover = self._dpad_hit_test(event.position())
         if self._dpad_hover != old_hover:
+            self.update()
+        # Overlay button hover
+        w = self.width()
+        old_obtn = self._obtn_hover
+        self._obtn_hover = self._obtn_hit_test(event.position(), w)
+        if self._obtn_hover != old_obtn:
             self.update()
         super().mouseMoveEvent(event)
 
@@ -1152,3 +1503,84 @@ class CameraWidget(QWidget):
         p.setPen(QColor(0x8E, 0x8E, 0x93, 180))
         p.drawText(QRectF(cx - sr, cy - 5, sr * 2, 10),
                    Qt.AlignmentFlag.AlignCenter, "STOP")
+
+    # ════════════ OVERLAY ACTION BUTTONS ════════════
+
+    def _obtn_rects(self):
+        """Return list of (label, QRectF, is_on) for overlay buttons."""
+        x, y, bw, bh, gap = self._OBTN_X, self._OBTN_Y, self._OBTN_W, self._OBTN_H, self._OBTN_GAP
+        return [
+            ('LSR',    QRectF(x, y, bw, bh),             self._obtn_laser_on),
+            ('DET',    QRectF(x, y + bh + gap, bw, bh),  self._obtn_detect_on),
+            ('TRACK',  QRectF(x, y + 2*(bh+gap), bw, bh), self._obtn_track_on),
+        ]
+
+    def _filter_label_rect(self, w):
+        """Return QRectF for filter label in top-right corner."""
+        name = self._FILTER_NAMES[self._video_filter]
+        fw = max(60, len(name) * 9 + 16)
+        return QRectF(w - fw - self._OBTN_X, self._OBTN_Y, fw, self._OBTN_H)
+
+    def _obtn_hit_test(self, pos, w):
+        """Return button key or 'FILTER' or None for given position."""
+        for label, rect, _ in self._obtn_rects():
+            if rect.contains(pos):
+                return label
+        if self._filter_label_rect(w).contains(pos):
+            return 'FILTER'
+        return None
+
+    def _draw_overlay_buttons(self, p, w, h):
+        """Draw semi-transparent overlay buttons (LSR, DET, TRACK) top-left and filter label top-right."""
+        # Button definitions: (label, rect, is_on, active_color)
+        btn_defs = [
+            ('LSR',   None, self._obtn_laser_on,  QColor(0xFF, 0x45, 0x3A)),
+            ('DET',   None, self._obtn_detect_on, QColor(0x30, 0xD1, 0x58)),
+            ('TRACK', None, self._obtn_track_on,  QColor(0xFF, 0x9F, 0x0A)),
+        ]
+        font = QFont("SF Pro Display", 8, QFont.Weight.Bold)
+        p.setFont(font)
+        fm = QFontMetrics(font)
+
+        x, y, bw, bh, gap = self._OBTN_X, self._OBTN_Y, self._OBTN_W, self._OBTN_H, self._OBTN_GAP
+        for i, (label, _, is_on, accent) in enumerate(btn_defs):
+            rect = QRectF(x, y + i * (bh + gap), bw, bh)
+            hovered = (self._obtn_hover == label)
+
+            # Background
+            if is_on:
+                bg = QColor(accent.red(), accent.green(), accent.blue(), 60)
+                border = QColor(accent.red(), accent.green(), accent.blue(), 180)
+            elif hovered:
+                bg = QColor(0x2D, 0x2D, 0x2D, 180)
+                border = QColor(0x8E, 0x8E, 0x93, 160)
+            else:
+                bg = QColor(0x1C, 0x1C, 0x1E, 160)
+                border = QColor(0x48, 0x48, 0x4A, 120)
+
+            p.setBrush(bg)
+            p.setPen(QPen(border, 1))
+            p.drawRoundedRect(rect, 4, 4)
+
+            # Label
+            if is_on:
+                p.setPen(accent)
+            elif hovered:
+                p.setPen(QColor(0xF5, 0xF5, 0xF7, 220))
+            else:
+                p.setPen(QColor(0x8E, 0x8E, 0x93, 180))
+            p.drawText(rect, Qt.AlignmentFlag.AlignCenter, label)
+
+        # Filter label (top-right)
+        fname = self._FILTER_NAMES[self._video_filter]
+        frect = self._filter_label_rect(w)
+        f_hovered = (self._obtn_hover == 'FILTER')
+        f_bg = QColor(0x2D, 0x2D, 0x2D, 180) if f_hovered else QColor(0x1C, 0x1C, 0x1E, 160)
+        f_border = QColor(0x8E, 0x8E, 0x93, 160) if f_hovered else QColor(0x48, 0x48, 0x4A, 120)
+        p.setBrush(f_bg)
+        p.setPen(QPen(f_border, 1))
+        p.drawRoundedRect(frect, 4, 4)
+        f_pen = QColor(0xF5, 0xF5, 0xF7, 220) if f_hovered else QColor(0x8E, 0x8E, 0x93, 180)
+        p.setPen(f_pen)
+        p.drawText(frect, Qt.AlignmentFlag.AlignCenter, f"⚙ {fname}")
+

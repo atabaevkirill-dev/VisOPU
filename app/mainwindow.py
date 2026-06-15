@@ -14,6 +14,7 @@ from PyQt6.QtGui import QAction, QFont, QColor
 from app.communicators import DeviceCommunicator, LaserCommunicator, PelcoDCommunicator, ONVIFCommunicator
 from app.widgets import (CollapsiblePanel, DirectionPad,
                           SpeedControl, CameraWidget, SlidingPanel, HAS_CV2)
+from app.detector import YoloDetector, FILTER_ALL, FILTER_AIR, FILTER_DRONE_VEHICLE
 from app.styles import (apply_apple_dark_style, STYLE_GO_BUTTON, STYLE_STOP_ALL,
                          STYLE_HOME_BUTTON, STYLE_DIAG_BUTTON, STYLE_LOG_TEXT,
                          COLOR_CONNECTED, COLOR_DISCONNECTED, COLOR_ERROR,
@@ -189,6 +190,22 @@ class MainWindow(QMainWindow):
         self._zoom_wheel_timer = QTimer()
         self._zoom_wheel_timer.setSingleShot(True)
         self._zoom_wheel_timer.timeout.connect(self._zoom_stop)
+
+        # YOLO detection state
+        self._detector = None          # YoloDetector instance
+        self._detecting = False        # detection active
+        self._tracking = False         # auto-follow active
+        self._track_target_id = None   # currently followed track_id
+        self._track_gain = 1.5         # proportional gain for auto-follow
+        self._track_deadzone = 0.05    # 5% of frame = centered
+        self._last_det_dx = 0.0
+        self._last_det_dy = 0.0
+        self._last_det_cls = ""
+
+        # Track controller timer (20 Hz proportional control loop)
+        self._track_timer = QTimer()
+        self._track_timer.setInterval(50)
+        self._track_timer.timeout.connect(self._track_control_tick)
 
     # ════════════════ MENU BAR ════════════════
     def _build_menu(self):
@@ -415,6 +432,23 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._save_settings()
+        # Stop tracking
+        if hasattr(self, '_track_timer') and self._track_timer.isActive():
+            self._track_timer.stop()
+        # Stop camera streams
+        for cam in (self.cam1_widget, self.cam2_widget):
+            if cam:
+                cam.disconnect_stream()
+        # Stop laser polling
+        if hasattr(self, 'laser_comm') and self.laser_comm.polling:
+            self.laser_comm.stop_continuous()
+        # Stop PAN-TILT polling
+        if hasattr(self, 'comm') and self.comm.polling:
+            self.comm.stop_polling()
+        # Destroy YOLO detector
+        if hasattr(self, '_detector') and self._detector:
+            self._detector.destroy()
+        # Clean up floating cameras window
         if hasattr(self, '_cameras_win'):
             self._cameras_win.deleteLater()
         super().closeEvent(event)
@@ -685,6 +719,63 @@ class MainWindow(QMainWindow):
         zoom.content_layout().addLayout(zl)
         right.addWidget(zoom)
 
+        # ── DETECTION ──
+        det_panel = CollapsiblePanel("DETECTION")
+        dt = QVBoxLayout()
+        dt.setSpacing(4)
+        self.det_model_lbl = QLabel("Model: Not Loaded")
+        self.det_model_lbl.setStyleSheet(
+            "color:#636366; font:600 10px 'SF Pro Display';")
+        dt.addWidget(self.det_model_lbl)
+        det_btn_row = QHBoxLayout()
+        self.detect_btn = QPushButton("DETECT")
+        self.detect_btn.setCheckable(True)
+        self.detect_btn.clicked.connect(self._toggle_detection)
+        det_btn_row.addWidget(self.detect_btn)
+        self.track_btn = QPushButton("TRACK")
+        self.track_btn.setCheckable(True)
+        self.track_btn.setEnabled(False)
+        self.track_btn.clicked.connect(self._toggle_tracking)
+        det_btn_row.addWidget(self.track_btn)
+        dt.addLayout(det_btn_row)
+        # Class filter
+        flt_row = QHBoxLayout()
+        flt_row.addWidget(QLabel("Filter:"))
+        self.det_filter_combo = QComboBox()
+        self.det_filter_combo.addItems(["All Classes", "Air Targets", "Drones + Vehicles"])
+        self.det_filter_combo.currentIndexChanged.connect(self._on_filter_changed)
+        flt_row.addWidget(self.det_filter_combo, 1)
+        dt.addLayout(flt_row)
+        # Target info
+        self.det_target_lbl = QLabel("NO TARGET")
+        self.det_target_lbl.setStyleSheet(
+            "color:#636366; font:600 11px 'SF Pro Display';")
+        self.det_target_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        dt.addWidget(self.det_target_lbl)
+        # Lock / cycle target buttons
+        tgt_row = QHBoxLayout()
+        self.det_lock_btn = QPushButton("AUTO-LOCK")
+        self.det_lock_btn.setEnabled(False)
+        self.det_lock_btn.clicked.connect(self._auto_lock_target)
+        tgt_row.addWidget(self.det_lock_btn)
+        self.det_cycle_btn = QPushButton("NEXT")
+        self.det_cycle_btn.setEnabled(False)
+        self.det_cycle_btn.clicked.connect(self._cycle_target)
+        tgt_row.addWidget(self.det_cycle_btn)
+        dt.addLayout(tgt_row)
+        # Stop tracking
+        self.det_stop_btn = QPushButton("STOP TRACKING")
+        self.det_stop_btn.setEnabled(False)
+        self.det_stop_btn.clicked.connect(self._stop_tracking)
+        dt.addWidget(self.det_stop_btn)
+        # FPS
+        self.det_fps_lbl = QLabel("FPS: --")
+        self.det_fps_lbl.setStyleSheet(
+            "color:#636366; font:10px 'SF Pro Display';")
+        dt.addWidget(self.det_fps_lbl)
+        det_panel.content_layout().addLayout(dt)
+        right.addWidget(det_panel)
+
         # Device state
         st = CollapsiblePanel("DEVICE STATE")
         sg = QGridLayout()
@@ -713,7 +804,7 @@ class MainWindow(QMainWindow):
         ll = QVBoxLayout()
         self.log_text = QPlainTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumBlockCount(25)
+        self.log_text.setMaximumBlockCount(50)
         self.log_text.setStyleSheet(STYLE_LOG_TEXT)
         self.log_text.setFixedHeight(200)
         ll.addWidget(self.log_text)
@@ -732,23 +823,29 @@ class MainWindow(QMainWindow):
         self.comm.tilt_speed_updated.connect(self._on_real_tilt_spd)
         self.comm.temperature_updated.connect(self._on_real_temp)
         self.comm.connection_changed.connect(self._on_connection)
-        self.comm.error_occurred.connect(lambda e: self._log(f"[ERR] {e}"))
-        self.comm.log_message.connect(self._log)
+        self.comm.error_occurred.connect(lambda e: self._log(f"[PAN-TILT ERR] {e}"))
         self.laser_comm.distance_updated.connect(self._on_laser_distance)
         self.laser_comm.connection_changed.connect(self._on_laser_connection)
         self.laser_comm.error_occurred.connect(lambda e: self._log(f"[LASER ERR] {e}"))
-        self.laser_comm.log_message.connect(self._log)
         self.pelco_comm.connection_changed.connect(self._on_pelco_connection)
-        self.pelco_comm.error_occurred.connect(lambda e: self._log(f"[ZOOM ERR] {e}"))
-        self.pelco_comm.log_message.connect(self._log)
+        self.pelco_comm.error_occurred.connect(lambda e: self._log(f"[PELCO ERR] {e}"))
         self.onvif_comm.connection_changed.connect(self._on_onvif_connection)
-        self.onvif_comm.error_occurred.connect(lambda e: self._log(f"[ZOOM ERR] {e}"))
-        self.onvif_comm.log_message.connect(self._log)
+        self.onvif_comm.error_occurred.connect(lambda e: self._log(f"[ONVIF ERR] {e}"))
         # Video overlay D-Pad + zoom scroll from camera widgets
         for cam in (self.cam1_widget, self.cam2_widget):
             cam.video_dpad_pressed.connect(self._on_dpad_pressed)
             cam.video_dpad_released.connect(self._on_dpad_released)
             cam.zoom_scroll.connect(self._on_zoom_scroll)
+        # Detection signals from CAM1
+        self.cam1_widget.detection_target.connect(self._on_detection_target)
+        self.cam1_widget.detections_updated.connect(self._on_detections_updated)
+        self.cam1_widget.detection_fps.connect(self._on_detection_fps)
+        # Video overlay buttons (LSR, DET, TRK, FILTER) from both cameras
+        for cam in (self.cam1_widget, self.cam2_widget):
+            cam.video_laser_toggled.connect(self._on_video_laser)
+            cam.video_detect_toggled.connect(self._on_video_detect)
+            cam.video_track_toggled.connect(self._on_video_track)
+            cam.video_filter_changed.connect(self._on_video_filter)
 
     # ════════════════ CALLBACKS ════════════════
     def _on_real_pan(self, v):
@@ -934,6 +1031,9 @@ class MainWindow(QMainWindow):
                 if cam:
                     cam.clear_laser_overlay()
             self._log("[LASER] Continuous ranging stopped")
+            # Sync overlay button state
+            for cam in (self.cam1_widget, self.cam2_widget):
+                cam.set_laser_state(False)
         else:
             self.laser_comm.start_continuous()
             self.laser_cont_btn.setText("STOP CONT")
@@ -952,6 +1052,9 @@ class MainWindow(QMainWindow):
             if cam:
                 cam.clear_laser_overlay()
         self._log("[LASER] Ranging stopped, display cleared")
+        # Sync overlay button state
+        for cam in (self.cam1_widget, self.cam2_widget):
+            cam.set_laser_state(False)
 
     def _laser_selfcheck(self):
         if not self.laser_connected:
@@ -977,14 +1080,11 @@ class MainWindow(QMainWindow):
 
     # ════════════════ ZOOM (ONVIF) ════════════════
     def _ensure_onvif_connected(self):
-        """Auto-connect to ONVIF camera if not connected."""
+        """Auto-connect ONVIF if not connected, then return status."""
         if not self.onvif_connected:
-            self._log(f"[ZOOM] Auto-connecting to {self._onvif_ip}...")
+            self._log(f"[ZOOM] Connecting ONVIF {self._onvif_ip}...")
             self.onvif_comm.connect_device(
                 self._onvif_ip, self._onvif_user, self._onvif_pass, self._onvif_port)
-            # Give it a moment to connect
-            import time
-            time.sleep(0.5)
         return self.onvif_connected
 
     def _zoom_tele(self):
@@ -1046,6 +1146,318 @@ class MainWindow(QMainWindow):
             self._log(f"[ZOOM] Scroll→Wide speed={spd:.2f}")
         # Restart stop timer — zoom stops 300ms after last scroll notch
         self._zoom_wheel_timer.start(300)
+
+    # ════════════════ DETECTION & TRACKING ════════════════
+    def _toggle_detection(self):
+        """Start or stop YOLO detection on CAM1."""
+        if self._detecting:
+            # Stop detection
+            self._detecting = False
+            self._tracking = False
+            self._track_timer.stop()
+            if self.cam1_widget:
+                self.cam1_widget.disable_detection()
+            if self._detector:
+                self._detector.reset_tracker()
+            self.detect_btn.setChecked(False)
+            self.detect_btn.setText("DETECT")
+            self.detect_btn.setStyleSheet("")
+            self.track_btn.setEnabled(False)
+            self.track_btn.setChecked(False)
+            self.track_btn.setText("TRACK")
+            self.track_btn.setStyleSheet("")
+            self.det_lock_btn.setEnabled(False)
+            self.det_cycle_btn.setEnabled(False)
+            self.det_stop_btn.setEnabled(False)
+            self.det_target_lbl.setText("NO TARGET")
+            self.det_target_lbl.setStyleSheet(
+                "color:#636366; font:600 11px 'SF Pro Display';")
+            self.det_fps_lbl.setText("FPS: --")
+            self._track_target_id = None
+            # Sync overlay button states
+            for cam in (self.cam1_widget, self.cam2_widget):
+                cam.set_detect_state(False)
+                cam.set_track_state(False)
+            self._log("[DETECT] Detection stopped")
+            return
+
+        # Start detection — initialize model if needed
+        if self._detector is None:
+            self._detector = YoloDetector()
+            self._log("[DETECT] Initializing model...")
+            self.det_model_lbl.setText("Loading...")
+            # Run initialization in background thread to avoid blocking UI
+            threading.Thread(target=self._init_detector_bg, daemon=True).start()
+        else:
+            self._start_detection_on_cam()
+
+    def _init_detector_bg(self):
+        """Initialize YOLO model in background thread."""
+        ok = self._detector.initialize()
+        # Use QTimer.singleShot(0, ...) to call on main thread
+        QTimer.singleShot(0, lambda: self._on_detector_ready(ok))
+
+    def _on_detector_ready(self, ok):
+        """Called on main thread after detector initialization."""
+        if ok:
+            name = self._detector.model_name
+            backend = self._detector.backend
+            self.det_model_lbl.setText(f"Model: {name} ({backend})")
+            self.det_model_lbl.setStyleSheet(
+                "color:#30d158; font:600 10px 'SF Pro Display';")
+            self._log(f"[DETECT] Loaded {name} ({backend})")
+            self._apply_filter()
+            self._start_detection_on_cam()
+        else:
+            reason = self._detector.backend if self._detector else "unknown"
+            self.det_model_lbl.setText(f"Model: {reason}")
+            self.det_model_lbl.setStyleSheet(
+                "color:#ff453a; font:600 10px 'SF Pro Display';")
+            self._log(f"[DETECT] Failed: {reason}")
+            self._detecting = False
+            self.detect_btn.setChecked(False)
+
+    def _start_detection_on_cam(self):
+        """Enable detection on CAM1 widget."""
+        self._detecting = True
+        self.detect_btn.setText("STOP DET")
+        self.detect_btn.setStyleSheet(
+            "background:#ff453a; color:white; font:600 11px 'SF Pro Display';")
+        self.track_btn.setEnabled(True)
+        self.det_stop_btn.setEnabled(True)
+        if self.cam1_widget and self._detector:
+            self.cam1_widget.enable_detection(self._detector)
+        # Sync overlay button states
+        for cam in (self.cam1_widget, self.cam2_widget):
+            cam.set_detect_state(True)
+        self._log("[DETECT] Detection started on CAM1")
+
+    def _toggle_tracking(self):
+        """Enable or disable auto-follow tracking."""
+        if self._tracking:
+            self._tracking = False
+            self._track_timer.stop()
+            self.track_btn.setChecked(False)
+            self.track_btn.setText("TRACK")
+            self.track_btn.setStyleSheet("")
+            self.det_lock_btn.setEnabled(False)
+            self.det_cycle_btn.setEnabled(False)
+            self.det_target_lbl.setText("NO TARGET")
+            self.det_target_lbl.setStyleSheet(
+                "color:#636366; font:600 11px 'SF Pro Display';")
+            self._track_target_id = None
+            if self.cam1_widget:
+                self.cam1_widget.select_track_target(None)
+            # Sync overlay button states
+            for cam in (self.cam1_widget, self.cam2_widget):
+                cam.set_track_state(False)
+            self._log("[TRACK] Auto-follow disabled")
+            return
+
+        self._tracking = True
+        self.track_btn.setText("STOP TRK")
+        self.track_btn.setStyleSheet(
+            "background:#ff9f0a; color:white; font:600 11px 'SF Pro Display';")
+        self.det_lock_btn.setEnabled(True)
+        self.det_cycle_btn.setEnabled(True)
+        self.det_stop_btn.setEnabled(True)
+        self._track_timer.start()
+        # Sync overlay button states
+        for cam in (self.cam1_widget, self.cam2_widget):
+            cam.set_track_state(True)
+        self._log("[TRACK] Auto-follow enabled — select a target")
+
+    def _on_filter_changed(self, idx):
+        """Update class filter on the detector."""
+        self._apply_filter()
+
+    def _apply_filter(self):
+        """Apply current filter selection to detector."""
+        if not self._detector:
+            return
+        idx = self.det_filter_combo.currentIndex()
+        if idx == 0:
+            self._detector.set_classes(None)  # all
+        elif idx == 1:
+            self._detector.set_classes(FILTER_AIR)
+        elif idx == 2:
+            self._detector.set_classes(FILTER_DRONE_VEHICLE)
+        self._log(f"[DETECT] Filter: {['All Classes','Air Targets','Drones+Vehicles'][idx]}")
+
+    def _auto_lock_target(self):
+        """Auto-select the best tracked target (largest air target, or largest any)."""
+        if not self.cam1_widget:
+            return
+        targets = self.cam1_widget.get_tracked_targets()
+        if not targets:
+            self._log("[TRACK] No tracked targets available")
+            return
+        # Prefer air targets, then largest area
+        air = [t for t in targets if t.is_air_target]
+        best = max(air, key=lambda t: t.area) if air else max(targets, key=lambda t: t.area)
+        self._select_track_id(best.track_id, best.class_name)
+
+    def _cycle_target(self):
+        """Cycle to the next tracked target."""
+        if not self.cam1_widget:
+            return
+        targets = self.cam1_widget.get_tracked_targets()
+        if not targets:
+            return
+        ids = [t.track_id for t in targets]
+        if self._track_target_id in ids:
+            idx = (ids.index(self._track_target_id) + 1) % len(ids)
+        else:
+            idx = 0
+        t = targets[idx] if idx < len(targets) else targets[0]
+        self._select_track_id(t.track_id, t.class_name)
+
+    def _select_track_id(self, track_id, class_name=""):
+        """Set a specific track ID as the follow target."""
+        self._track_target_id = track_id
+        if self.cam1_widget:
+            self.cam1_widget.select_track_target(track_id)
+        self.det_target_lbl.setText(f"LOCKED: #{track_id} {class_name.upper()}")
+        self.det_target_lbl.setStyleSheet(
+            "color:#30d158; font:600 11px 'SF Pro Display';")
+        self._log(f"[TRACK] Locked target #{track_id} ({class_name})")
+
+    def _stop_tracking(self):
+        """Stop tracking and auto-follow."""
+        self._tracking = False
+        self._track_timer.stop()
+        self._track_target_id = None
+        if self.cam1_widget:
+            self.cam1_widget.select_track_target(None)
+        # Sync overlay button states
+        for cam in (self.cam1_widget, self.cam2_widget):
+            cam.set_track_state(False)
+        self.track_btn.setChecked(False)
+        self.track_btn.setText("TRACK")
+        self.track_btn.setStyleSheet("")
+        self.det_target_lbl.setText("NO TARGET")
+        self.det_target_lbl.setStyleSheet(
+            "color:#636366; font:600 11px 'SF Pro Display';")
+        self.det_lock_btn.setEnabled(False)
+        self.det_cycle_btn.setEnabled(False)
+        if self.is_connected:
+            self.comm.stop_all()
+        self._log("[TRACK] Tracking stopped, all movement halted")
+
+    def _on_detection_target(self, dx, dy, cls_name):
+        """Store latest target offset from CAM1 detection thread."""
+        self._last_det_dx = dx
+        self._last_det_dy = dy
+        self._last_det_cls = cls_name
+
+    def _on_detections_updated(self, dets):
+        """Update target info when detection list changes."""
+        if not self._tracking or not self._track_target_id:
+            return
+        # Check if our target is still present
+        found = False
+        for d in dets:
+            if d.track_id == self._track_target_id:
+                found = True
+                self.det_target_lbl.setText(
+                    f"LOCKED: #{d.track_id} {d.class_name.upper()} {d.confidence:.0%}")
+                break
+        if not found:
+            self.det_target_lbl.setText(f"TARGET #{self._track_target_id} LOST")
+            self.det_target_lbl.setStyleSheet(
+                "color:#ff9f0a; font:600 11px 'SF Pro Display';")
+
+    def _on_detection_fps(self, fps):
+        """Update FPS display."""
+        self.det_fps_lbl.setText(f"FPS: {fps:.1f}")
+
+    def _track_control_tick(self):
+        """20 Hz proportional auto-follow controller."""
+        if not self._tracking or self._track_target_id is None:
+            return
+        dx, dy = self._last_det_dx, self._last_det_dy
+        cls = self._last_det_cls
+
+        # Empty class name + zero offset = target lost
+        if cls == "" and abs(dx) < 0.001 and abs(dy) < 0.001:
+            # Target lost — stop movement
+            if self.is_connected:
+                self.comm.pan_stop()
+                self.comm.tilt_stop()
+            return
+
+        # Dead zone — target is centered enough
+        if abs(dx) < self._track_deadzone and abs(dy) < self._track_deadzone:
+            if self.is_connected:
+                self.comm.pan_stop()
+                self.comm.tilt_stop()
+            return
+
+        # Calculate proportional speeds
+        base_pan = self.pan_speed_ctrl.get_speed()
+        base_tilt = self.tilt_speed_ctrl.get_speed()
+        if abs(base_pan) < 0.1:
+            base_pan = 20.0
+        if abs(base_tilt) < 0.1:
+            base_tilt = 10.0
+
+        pan_spd = dx * self._track_gain * abs(base_pan)
+        tilt_spd = -dy * self._track_gain * abs(base_tilt)
+
+        # Clamp
+        pan_spd = max(-abs(base_pan), min(abs(base_pan), pan_spd))
+        tilt_spd = max(-abs(base_tilt), min(abs(base_tilt), tilt_spd))
+
+        if self.is_connected:
+            tilt_sign = self._get_tilt_sign()
+            self.comm.pan_set_speed(pan_spd)
+            self.comm.tilt_set_speed(tilt_spd * tilt_sign)
+
+    # ════════════════ VIDEO OVERLAY BUTTONS ════════════════
+    def _on_video_laser(self, on):
+        """Video overlay LSR button: start/stop laser ranging."""
+        if on:
+            if not self.laser_connected:
+                self._log("[LASER] Not connected")
+                for cam in (self.cam1_widget, self.cam2_widget):
+                    cam.set_laser_state(False)
+                return
+            self.laser_comm.start_continuous()
+            self.laser_cont_btn.setText("STOP CONT")
+            self._log("[LASER] Continuous ranging started")
+        else:
+            self._laser_stop()
+
+    def _on_video_detect(self, on):
+        """Video overlay DET button: start/stop detection."""
+        # Sync state: if already in desired state, skip
+        if self._detecting == on:
+            return
+        self._toggle_detection()
+
+    def _on_video_track(self, on):
+        """Video overlay TRK button: start/stop auto-follow."""
+        if self._tracking == on:
+            return
+        # Tracking requires detection active
+        if on and not self._detecting:
+            self._log("[TRACK] Enable detection first")
+            for cam in (self.cam1_widget, self.cam2_widget):
+                cam.set_track_state(False)
+            return
+        if on and not self._track_target_id:
+            # Auto-lock to best target if none selected
+            self._auto_lock_target()
+        self._toggle_tracking()
+
+    def _on_video_filter(self, name):
+        """Video filter changed on overlay."""
+        # Sync filter to both cameras
+        filter_map = {'NORMAL': 0, 'NVG': 1, 'EDGE': 2, 'BW': 3}
+        mode = filter_map.get(name, 0)
+        for cam in (self.cam1_widget, self.cam2_widget):
+            cam.set_video_filter(mode)
+        self._log(f"[VIDEO] Filter: {name}")
 
     # ════════════════ D-PAD ════════════════
     def _on_dpad_pressed(self, d):

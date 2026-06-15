@@ -56,7 +56,6 @@ class DeviceCommunicator(QObject):
             try:
                 self.socket.sendall((cmd + "\n").encode())
                 data = self.socket.recv(1024).decode().strip()
-                self.log_message.emit(f">> {cmd}  << {data}")
                 return data
             except Exception as e:
                 self.error_occurred.emit(str(e))
@@ -101,7 +100,7 @@ class DeviceCommunicator(QObject):
                 if resp and resp.startswith("$t,"):
                     val = float(resp.split(",")[1].rstrip("#"))
                     self.temperature_updated.emit(val)
-            except:
+            except Exception:
                 pass
             time.sleep(0.25)
 
@@ -203,8 +202,6 @@ class LaserCommunicator(QObject):
                 self.socket.sendall(cmd)
                 time.sleep(0.15)
                 data = self.socket.recv(256)
-                hex_str = data.hex()
-                self.log_message.emit(f">> {cmd.hex()}  << {hex_str}")
                 if len(data) >= 10 and data[0] == 0xEE and data[1] == 0x16:
                     return data
                 return None
@@ -251,7 +248,7 @@ class LaserCommunicator(QObject):
                     status = data[5]
                     dist = data[6] * 256 + data[7] + data[8] * 0.1
                     self.distance_updated.emit(dist, status)
-            except:
+            except Exception:
                 pass
             time.sleep(0.3)
 
@@ -322,9 +319,6 @@ class PelcoDCommunicator(QObject):
             try:
                 frame = self._build_frame(byte2, byte3, byte4, byte5)
                 self.socket.sendall(frame)
-                self.log_message.emit(
-                    f">> Pelco-D [{frame.hex()}]  "
-                    f"cmd=0x{byte2:02X}{byte3:02X} data=0x{byte4:02X}{byte5:02X}")
                 return True
             except Exception as e:
                 self.error_occurred.emit(str(e))
@@ -423,7 +417,7 @@ class ONVIFCommunicator(QObject):
                 self.error_occurred.emit("No ONVIF profiles found on camera")
                 return
             self._profile_token = profiles[0].token
-            self.log_message.emit(f"[ONVIF] Profile token: {self._profile_token}")
+
 
             # Get PTZ service
             self._ptz = self._cam.create_ptz_service()
@@ -432,13 +426,9 @@ class ONVIFCommunicator(QObject):
             configs = self._ptz.GetConfigurations()
             if configs:
                 self._ptz_config = configs[0]
-                zoom_max = configs[0].ZoomLimits
-                self.log_message.emit(
-                    f"[ONVIF] PTZ config loaded, zoom range: {zoom_max}")
 
             self.connected = True
             self.connection_changed.emit(True)
-            self.log_message.emit(f"[ONVIF] Connected to {ip}:{port}")
         except Exception as e:
             self.error_occurred.emit(f"ONVIF connect failed: {e}")
             self.connected = False
@@ -472,7 +462,6 @@ class ONVIFCommunicator(QObject):
             request.ProfileToken = self._profile_token
             request.Velocity = {'PanTilt': {'x': 0, 'y': 0}, 'Zoom': {'x': speed}}
             self._ptz.ContinuousMove(request)
-            self.log_message.emit(f">> ONVIF ZoomTele speed={speed:.2f}")
         except Exception as e:
             self.error_occurred.emit(f"ZoomTele: {e}")
 
@@ -486,7 +475,6 @@ class ONVIFCommunicator(QObject):
             request.ProfileToken = self._profile_token
             request.Velocity = {'PanTilt': {'x': 0, 'y': 0}, 'Zoom': {'x': -speed}}
             self._ptz.ContinuousMove(request)
-            self.log_message.emit(f">> ONVIF ZoomWide speed={speed:.2f}")
         except Exception as e:
             self.error_occurred.emit(f"ZoomWide: {e}")
 
@@ -500,7 +488,6 @@ class ONVIFCommunicator(QObject):
             request.PanTilt = True
             request.Zoom = True
             self._ptz.Stop(request)
-            self.log_message.emit(">> ONVIF Stop")
         except Exception as e:
             self.error_occurred.emit(f"Stop: {e}")
 
@@ -512,9 +499,7 @@ class ONVIFCommunicator(QObject):
             speed = max(0.0, min(1.0, speed))
             request = self._ptz.create_type('ContinuousMove')
             request.ProfileToken = self._profile_token
-            # Focus uses MoveSpace, but for simplicity we use zoom axis trick
-            # Most cameras support focus via Imaging service
-            self.log_message.emit(f">> ONVIF FocusNear speed={speed:.2f}")
+
         except Exception as e:
             self.error_occurred.emit(f"FocusNear: {e}")
 
@@ -524,7 +509,6 @@ class ONVIFCommunicator(QObject):
             return
         try:
             speed = max(0.0, min(1.0, speed))
-            self.log_message.emit(f">> ONVIF FocusFar speed={speed:.2f}")
         except Exception as e:
             self.error_occurred.emit(f"FocusFar: {e}")
 
@@ -536,7 +520,6 @@ class ONVIFCommunicator(QObject):
             imaging = self._cam.create_imaging_service()
             # Get video source config token
             configs = imaging.GetMoveOptions(0)  # source token 0
-            self.log_message.emit(">> ONVIF AutoFocus enabled")
         except Exception as e:
             self.error_occurred.emit(f"AutoFocus: {e}")
 
