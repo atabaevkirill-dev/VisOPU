@@ -1,15 +1,25 @@
 """Custom PyQt6 widgets for VisOPU application."""
+from __future__ import annotations
 
 import math
 import threading
 import time
+from PyQt6 import sip
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider,
                               QSizePolicy, QFrame, QPlainTextEdit)
 from PyQt6.QtCore import (Qt, QTimer, QPointF, QRectF, pyqtSignal,
-                           QPropertyAnimation, QEasingCurve)
+                           QPropertyAnimation, QEasingCurve, QUrl)
 from PyQt6.QtGui import (QPainter, QColor, QPen, QBrush, QFontMetrics,
                           QRadialGradient, QPolygonF, QFont, QPainterPath,
                           QImage, QPixmap)
+
+try:
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    HAS_WEBENGINE = True
+except ImportError:
+    HAS_WEBENGINE = False
+
+from app.offline_map import MBTilesServer
 
 try:
     import cv2
@@ -290,201 +300,43 @@ class _ToggleStrip(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# COMPASS / PAN-TILT VISUALIZATION
-# ═══════════════════════════════════════════════════════════════════
-
-class DeviceVisualization(QWidget):
-    """Minimalist PAN-TILT compass with Apple Dark styling."""
-
-    C_RING  = QColor(0x48, 0x48, 0x4A, 160)
-    C_TICK  = QColor(0x8E, 0x8E, 0x93, 200)
-    C_LABEL = QColor(0xF5, 0xF5, 0xF7, 230)
-    C_ARROW = QColor(0x0A, 0x84, 0xFF)
-    C_GLOW  = QColor(0x0A, 0x84, 0xFF, 35)
-    C_CENTER= QColor(0x63, 0x63, 0x66, 160)
-    C_DIM   = QColor(0x63, 0x63, 0x66)
-    C_BG    = QColor(0x1C, 0x1C, 0x1E)
-
-    def __init__(self):
-        super().__init__()
-        self.pan_angle = 0.0
-        self.tilt_angle = 0.0
-        self.target_pan = 0.0
-        self.target_tilt = 0.0
-        self.tilt_inverted = False
-        self.display_tilt = 0.0
-        self.setMinimumSize(100, 100)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-
-        self.timer = QTimer()
-        self.timer.timeout.connect(self._tick)
-        self.timer.start(20)
-
-    def set_angles(self, pan, tilt):
-        self.target_pan = pan
-        self.target_tilt = tilt
-
-    def set_tilt_inverted(self, inv):
-        self.tilt_inverted = inv
-        self.update()
-
-    def set_speeds(self, pan_spd, tilt_spd):
-        pass
-
-    def _tick(self):
-        pan_diff = ((self.target_pan - self.pan_angle + 180) % 360) - 180
-        self.pan_angle = (self.pan_angle + pan_diff * 0.12) % 360
-        self.tilt_angle += (self.target_tilt - self.tilt_angle) * 0.12
-        self.display_tilt += (self.tilt_angle - self.display_tilt) * 0.12
-        self.update()
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.fillRect(self.rect(), self.C_BG)
-
-        w, h = self.width(), self.height()
-        cx, cy = w // 2 - 20, h // 2
-        R = min(w * 0.38, h * 0.34)
-
-        self._draw_compass(p, cx, cy, R)
-        bar_x = cx + R + 45
-        bar_h = R * 2
-        self._draw_tilt_bar(p, bar_x, cy - bar_h / 2, bar_h)
-        self._draw_values(p, w)
-        p.end()
-
-    def _draw_compass(self, p, cx, cy, R):
-        p.setPen(QPen(self.C_RING, 1.5))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawEllipse(QPointF(cx, cy), R + 4, R + 4)
-
-        for deg in range(0, 360, 30):
-            rad = math.radians(deg - 90)
-            r1 = R - 6
-            r2 = R + 4
-            x1 = cx + r1 * math.cos(rad)
-            y1 = cy + r1 * math.sin(rad)
-            x2 = cx + r2 * math.cos(rad)
-            y2 = cy + r2 * math.sin(rad)
-            p.setPen(QPen(self.C_TICK, 1.5 if deg % 90 == 0 else 1))
-            p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
-
-        for deg, label in {0: "N", 90: "E", 180: "S", 270: "W"}.items():
-            rad = math.radians(deg - 90)
-            tx = cx + (R + 18) * math.cos(rad)
-            ty = cy + (R + 18) * math.sin(rad)
-            p.setFont(QFont("SF Pro Display", 10, QFont.Weight.Bold))
-            p.setPen(self.C_LABEL)
-            p.drawText(QRectF(tx - 10, ty - 8, 20, 16),
-                       Qt.AlignmentFlag.AlignCenter, label)
-
-        for deg in (60, 120, 240, 300):
-            rad = math.radians(deg - 90)
-            tx = cx + (R + 16) * math.cos(rad)
-            ty = cy + (R + 16) * math.sin(rad)
-            p.setFont(QFont("SF Pro Display", 7))
-            p.setPen(self.C_DIM)
-            p.drawText(QRectF(tx - 12, ty - 6, 24, 12),
-                       Qt.AlignmentFlag.AlignCenter, str(deg))
-
-        p.save()
-        p.translate(cx, cy)
-        p.rotate(self.pan_angle)
-
-        p.setPen(QPen(self.C_RING, 1))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawEllipse(QPointF(0, 0), R * 0.25, R * 0.25)
-
-        p.setPen(QPen(self.C_ARROW, 2))
-        p.drawLine(QPointF(0, -R * 0.25), QPointF(0, -R * 0.88))
-
-        tri = QPolygonF([
-            QPointF(0, -R * 0.95),
-            QPointF(-6, -R * 0.80),
-            QPointF(6, -R * 0.80),
-        ])
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(self.C_ARROW)
-        p.drawPolygon(tri)
-
-        p.drawEllipse(QPointF(0, 0), 3, 3)
-        p.restore()
-
-    def _draw_tilt_bar(self, p, bar_x, bar_y1, bar_h):
-        bar_y2 = bar_y1 + bar_h
-        p.setPen(QPen(self.C_DIM, 2))
-        p.drawLine(QPointF(bar_x, bar_y1), QPointF(bar_x, bar_y2))
-
-        for deg in (45, 0, -45, -90):
-            norm = (45 - deg) / 135.0
-            ty = bar_y1 + norm * bar_h
-            p.setPen(QPen(self.C_RING, 1))
-            p.drawLine(QPointF(bar_x - 6, ty), QPointF(bar_x + 6, ty))
-            p.setFont(QFont("SF Pro Display", 7))
-            p.setPen(self.C_DIM)
-            label = f"+{deg}°" if deg > 0 else f"{deg}°"
-            p.drawText(QRectF(bar_x + 10, ty - 5, 36, 10),
-                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                       label)
-
-        zero_norm = 45.0 / 135.0
-        zero_y = bar_y1 + zero_norm * bar_h
-        p.setPen(QPen(self.C_LABEL, 1.5))
-        p.drawLine(QPointF(bar_x - 8, zero_y), QPointF(bar_x + 8, zero_y))
-
-        clamped = max(-90.0, min(45.0, self.display_tilt))
-        tilt_norm = (45 - clamped) / 135.0
-        my = bar_y1 + tilt_norm * bar_h
-        my = max(bar_y1, min(bar_y2, my))
-
-        diamond = QPolygonF([
-            QPointF(bar_x, my - 6),
-            QPointF(bar_x + 5, my),
-            QPointF(bar_x, my + 6),
-            QPointF(bar_x - 5, my),
-        ])
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(self.C_ARROW)
-        p.drawPolygon(diamond)
-
-    def _draw_values(self, p, w):
-        p.setFont(QFont("SF Pro Display", 10, QFont.Weight.Bold))
-        p.setPen(self.C_LABEL)
-        p.drawText(10, 16, f"PAN {self.pan_angle:7.2f}°  TILT {self.tilt_angle:7.2f}°")
-
-
-# ═══════════════════════════════════════════════════════════════════
 # DIRECTION PAD (8 directions)
 # ═══════════════════════════════════════════════════════════════════
 
 class DirectionPad(QWidget):
-    """8-direction D-Pad control widget with diagonals."""
+    """8-direction D-Pad control widget with diagonals (compact 160px)."""
     direction_pressed = pyqtSignal(str)
     direction_released = pyqtSignal(str)
 
+    _SZ = 160      # widget size
+    _CX = 80       # center x/y
+    _OR = 76       # outer radius
+    _CD = 38       # cardinal arrow distance from center
+    _DD = 30       # diagonal arrow distance
+    _SR = 12       # stop button radius
+
     def __init__(self):
         super().__init__()
-        self.setFixedSize(240, 240)
+        self.setFixedSize(self._SZ, self._SZ)
         self.pressed_dir = None
 
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        cx, cy = 120, 120
+        cx, cy = self._CX, self._CX
 
-        bg = QRadialGradient(cx, cy, 120)
+        bg = QRadialGradient(cx, cy, self._OR)
         bg.setColorAt(0, QColor(0x2D, 0x2D, 0x2D))
         bg.setColorAt(1, QColor(0x1C, 0x1C, 0x1E))
         p.setBrush(bg)
         p.setPen(QPen(QColor(0x48, 0x48, 0x4A), 1.5))
-        p.drawEllipse(QPointF(cx, cy), 115, 115)
+        p.drawEllipse(QPointF(cx, cy), self._OR, self._OR)
 
         cardinals = {
-            'UP':    (cx, cy - 58, 0),
-            'DOWN':  (cx, cy + 58, 180),
-            'LEFT':  (cx - 58, cy, 270),
-            'RIGHT': (cx + 58, cy, 90),
+            'UP':    (cx, cy - self._CD, 0),
+            'DOWN':  (cx, cy + self._CD, 180),
+            'LEFT':  (cx - self._CD, cy, 270),
+            'RIGHT': (cx + self._CD, cy, 90),
         }
         for d, (ax, ay, rot) in cardinals.items():
             pressed = self.pressed_dir == d
@@ -493,27 +345,26 @@ class DirectionPad(QWidget):
             p.translate(ax, ay)
             p.rotate(rot)
             tri = QPolygonF([
-                QPointF(0, -14), QPointF(11, 7), QPointF(4, 4),
-                QPointF(4, 14), QPointF(-4, 14), QPointF(-4, 4), QPointF(-11, 7),
+                QPointF(0, -10), QPointF(8, 5), QPointF(3, 3),
+                QPointF(3, 10), QPointF(-3, 10), QPointF(-3, 3), QPointF(-8, 5),
             ])
             if pressed:
-                g = QRadialGradient(0, 0, 18)
+                g = QRadialGradient(0, 0, 13)
                 g.setColorAt(0, QColor(0x0A, 0x84, 0xFF, 70))
                 g.setColorAt(1, QColor(0x0A, 0x84, 0xFF, 0))
                 p.setBrush(g)
                 p.setPen(Qt.PenStyle.NoPen)
-                p.drawEllipse(QPointF(0, 0), 18, 18)
+                p.drawEllipse(QPointF(0, 0), 13, 13)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(color)
             p.drawPolygon(tri)
             p.restore()
 
-        diag_dist = 44
         diag_dirs = {
-            'UP_RIGHT':   (cx + diag_dist, cy - diag_dist, 45),
-            'UP_LEFT':    (cx - diag_dist, cy - diag_dist, 315),
-            'DOWN_RIGHT': (cx + diag_dist, cy + diag_dist, 135),
-            'DOWN_LEFT':  (cx - diag_dist, cy + diag_dist, 225),
+            'UP_RIGHT':   (cx + self._DD, cy - self._DD, 45),
+            'UP_LEFT':    (cx - self._DD, cy - self._DD, 315),
+            'DOWN_RIGHT': (cx + self._DD, cy + self._DD, 135),
+            'DOWN_LEFT':  (cx - self._DD, cy + self._DD, 225),
         }
         for d, (ax, ay, rot) in diag_dirs.items():
             pressed = self.pressed_dir == d
@@ -522,28 +373,28 @@ class DirectionPad(QWidget):
             p.translate(ax, ay)
             p.rotate(rot)
             tri = QPolygonF([
-                QPointF(0, -10), QPointF(7, 4), QPointF(3, 2),
-                QPointF(3, 10), QPointF(-3, 10), QPointF(-3, 2), QPointF(-7, 4),
+                QPointF(0, -7), QPointF(5, 3), QPointF(2, 2),
+                QPointF(2, 7), QPointF(-2, 7), QPointF(-2, 3), QPointF(-5, 3),
             ])
             if pressed:
-                g = QRadialGradient(0, 0, 14)
+                g = QRadialGradient(0, 0, 10)
                 g.setColorAt(0, QColor(0x0A, 0x84, 0xFF, 50))
                 g.setColorAt(1, QColor(0x0A, 0x84, 0xFF, 0))
                 p.setBrush(g)
                 p.setPen(Qt.PenStyle.NoPen)
-                p.drawEllipse(QPointF(0, 0), 14, 14)
+                p.drawEllipse(QPointF(0, 0), 10, 10)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(color)
             p.drawPolygon(tri)
             p.restore()
 
         pressed_stop = self.pressed_dir == 'STOP'
-        p.setPen(QPen(QColor(0x48, 0x48, 0x4A), 2))
+        p.setPen(QPen(QColor(0x48, 0x48, 0x4A), 1.5))
         p.setBrush(QColor(0x0A, 0x84, 0xFF, 50) if pressed_stop else QColor(0x2D, 0x2D, 0x2D))
-        p.drawEllipse(QPointF(cx, cy), 18, 18)
-        p.setFont(QFont("SF Pro Display", 8, QFont.Weight.Bold))
+        p.drawEllipse(QPointF(cx, cy), self._SR, self._SR)
+        p.setFont(QFont("SF Pro Display", 7, QFont.Weight.Bold))
         p.setPen(QColor(0x8E, 0x8E, 0x93))
-        p.drawText(QRectF(cx - 18, cy - 7, 36, 14),
+        p.drawText(QRectF(cx - self._SR, cy - 5, self._SR * 2, 10),
                    Qt.AlignmentFlag.AlignCenter, "STOP")
 
         p.end()
@@ -562,12 +413,12 @@ class DirectionPad(QWidget):
             self.update()
 
     def _get_dir(self, pos):
-        cx, cy = 120, 120
+        cx, cy = self._CX, self._CX
         dx, dy = pos.x() - cx, pos.y() - cy
         dist = math.sqrt(dx * dx + dy * dy)
-        if dist < 20:
+        if dist < 14:
             return 'STOP'
-        if dist > 115:
+        if dist > self._OR:
             return None
         angle = math.degrees(math.atan2(-dy, dx))
         if angle < 0:
@@ -595,12 +446,13 @@ class DirectionPad(QWidget):
 # ═══════════════════════════════════════════════════════════════════
 
 class SpeedControl(QWidget):
-    """Speed setting widget — stores value only, no movement triggered."""
+    """Speed setting widget — stores magnitude value, emits signal on change."""
+    speed_changed = pyqtSignal(float)  # emits new speed in °/s
 
     def __init__(self, label, min_val, max_val, parent=None):
         super().__init__(parent)
-        self.min_val = min_val
-        self.max_val = max_val
+        self.min_val = min(0, min_val)  # speed can't be negative
+        self.max_val = max(1, max_val)
         layout = QVBoxLayout()
         layout.setSpacing(4)
 
@@ -615,8 +467,8 @@ class SpeedControl(QWidget):
         self.value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.slider = QSlider(Qt.Orientation.Horizontal)
-        self.slider.setMinimum(int(min_val * 10))
-        self.slider.setMaximum(int(max_val * 10))
+        self.slider.setMinimum(0)                     # always 0
+        self.slider.setMaximum(int(self.max_val * 10))  # e.g. 500 for max=50
         self.slider.setValue(0)
         self.slider.setStyleSheet("""
             QSlider::groove:horizontal {
@@ -648,10 +500,15 @@ class SpeedControl(QWidget):
 
     def _on_change(self, val):
         speed = val / 10.0
-        self.value_label.setText(f"{speed:>+.1f} °/s")
+        self.value_label.setText(f"{speed:.1f} °/s")
+        self.speed_changed.emit(speed)
 
     def get_speed(self):
         return self.slider.value() / 10.0
+
+    def set_speed(self, speed):
+        """Programmatically set slider value."""
+        self.slider.setValue(int(max(0, min(self.max_val, speed)) * 10))
 
     def reset(self):
         self.slider.blockSignals(True)
@@ -780,7 +637,7 @@ class CameraWidget(QWidget):
         if self.cap:
             try:
                 self.cap.release()
-            except:
+            except Exception:
                 pass
             self.cap = None
         with self._frame_lock:
@@ -1582,5 +1439,119 @@ class CameraWidget(QWidget):
         p.drawRoundedRect(frect, 4, 4)
         f_pen = QColor(0xF5, 0xF5, 0xF7, 220) if f_hovered else QColor(0x8E, 0x8E, 0x93, 180)
         p.setPen(f_pen)
-        p.drawText(frect, Qt.AlignmentFlag.AlignCenter, f"⚙ {fname}")
+        p.drawText(frect, Qt.AlignmentFlag.AlignCenter, f"\u2699 {fname}")
+
+
+
+
+class YandexMapWidget(QWidget):
+    """Map widget (Leaflet + local MBTiles or OSM fallback) with beam visualization."""
+
+    # Class-level server: shared across all instances, started once.
+    _server: MBTilesServer | None = None
+    _server_started = False
+
+    @classmethod
+    def _ensure_server(cls):
+        """Start the local tile server once (idempotent)."""
+        if not cls._server_started:
+            import os
+            mbtiles_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "data",
+            )
+            cls._server = MBTilesServer(mbtiles_dir=mbtiles_dir)
+            cls._server.start()
+            cls._server_started = True
+        return cls._server
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(200, 150)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setStyleSheet("background:#1c1c1e;")
+        self._last_pan = None
+        self._last_pan_time = 0
+        self._config_pending = None  # (lat, lng, offset, length) waiting for page load
+        self._js_ready = False       # True once Leaflet + JS bridge are loaded
+        self._js_queue: list[str] = []  # JS calls queued while page loads
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        if HAS_WEBENGINE:
+            srv = self._ensure_server()
+            self._web = QWebEngineView(self)
+            self._web.setStyleSheet("background:#1c1c1e;")
+            self._web.loadFinished.connect(self._on_page_loaded)
+            self._web.setUrl(QUrl(f"http://127.0.0.1:{srv.port}/"))
+            layout.addWidget(self._web, 1)
+        else:
+            self._fallback = QLabel(self)
+            self._fallback.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._fallback.setText("Map requires PyQt6-WebEngine\npip install PyQt6-WebEngine")
+            self._fallback.setStyleSheet(
+                "color:#636366; font:600 14px 'SF Pro Display'; background:#1c1c1e;")
+            layout.addWidget(self._fallback, 1)
+
+    # ── Internal ──
+
+    def _run_js(self, code: str):
+        """Run JS immediately if page is ready, otherwise queue it."""
+        if not HAS_WEBENGINE or not hasattr(self, '_web'):
+            return
+        if sip.isdeleted(self._web):
+            return
+        if self._js_ready:
+            self._web.page().runJavaScript(code)
+        else:
+            self._js_queue.append(code)
+
+    def _on_page_loaded(self, ok):
+        """Page finished loading — flush JS queue."""
+        if ok:
+            self._js_ready = True
+            # Flush queued JS calls in order
+            for code in self._js_queue:
+                self._web.page().runJavaScript(code)
+            self._js_queue.clear()
+            # Push saved config if pending
+            if self._config_pending:
+                lat, lng, offset, length, pan = self._config_pending
+                self._web.page().runJavaScript(
+                    f"pyApplyConfig({lat},{lng},{offset},{length},{pan})")
+                self._config_pending = None
+
+    # ── Public API (called from MainWindow) ──
+
+    def set_pan_angle(self, degrees):
+        """Update beam direction from PAN-TILT angle (throttled)."""
+        if not HAS_WEBENGINE or not hasattr(self, '_web'):
+            return
+        now = time.monotonic()
+        if self._last_pan is not None:
+            if abs(degrees - self._last_pan) < 0.05 and (now - self._last_pan_time) < 0.05:
+                return
+        self._last_pan = degrees
+        self._last_pan_time = now
+        self._run_js(f"pySetPan({degrees})")
+
+    def set_device_position(self, lat, lng):
+        """Set device location on the map (lat/lng)."""
+        self._run_js(f"pySetDevicePos({lat},{lng})")
+
+    def set_beam_offset(self, degrees):
+        """Set bearing offset added to PAN angle."""
+        self._run_js(f"pySetBeamOffset({degrees})")
+
+    def set_beam_length(self, meters):
+        """Set beam ray length in meters."""
+        self._run_js(f"pySetBeamLength({meters})")
+
+    def apply_saved_config(self, lat, lng, offset, length, pan=0):
+        """Apply saved config — queues it if page hasn't loaded yet."""
+        self._config_pending = (lat, lng, offset, length, pan)
+        # If page already loaded, push immediately
+        self._run_js(f"pyApplyConfig({lat},{lng},{offset},{length},{pan})")
 

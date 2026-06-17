@@ -156,19 +156,19 @@ class YoloDetector:
         self._lock = threading.Lock()
         self._class_filter: Optional[set] = None  # None = all classes
         self._imgsz = 640
-        self._conf = 0.35       # base confidence — higher = fewer false positives
-        self._iou = 0.45        # NMS threshold — lower = less overlap tolerance
-        self._max_det = 80      # realistic max for surveillance scene
+        self._conf = 0.25       # lower = catches more targets (drones, people)
+        self._iou = 0.45        # NMS threshold
+        self._max_det = 100     # max detections per frame
         self._half = False      # FP16 half-precision (GPU only)
-        self._augment = False   # TTA (GPU only)
+        self._augment = False   # TTA disabled — too slow for real-time
         self._clahe = None      # CLAHE preprocessor
-        self._min_bbox_area = 400  # minimum bbox area in pixels (filter noise)
+        self._min_bbox_area = 100  # min bbox area (10×10 px) — catches small drones
 
         # ── Multi-frame confirmation ──
         # Key: (track_id or bbox_key) → {hits, age, last_seen, last_bbox}
         self._track_history: Dict = {}
-        self._confirm_threshold = 2    # detections needed before display
-        self._decay_frames = 8         # frames before track expires
+        self._confirm_threshold = 1    # show after 1 detection (ByteTrack handles persistence)
+        self._decay_frames = 12        # frames before track expires
         self._frame_id = 0
 
         # ── Temporal EMA smoothing ──
@@ -233,7 +233,7 @@ class YoloDetector:
                 self._backend = "CUDA"
                 self._imgsz = 640
                 self._half = True
-                self._augment = True  # TTA for accuracy on GPU
+                self._augment = False  # TTA disabled — too slow for real-time
                 # Warmup: 3 dummy inferences to fully initialize CUDA kernels
                 dummy = np.zeros((64, 64, 3), dtype=np.uint8)
                 for _ in range(3):

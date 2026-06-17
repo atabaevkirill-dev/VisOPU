@@ -7,13 +7,14 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                               QSpinBox, QDoubleSpinBox, QLineEdit, QCheckBox,
                               QPlainTextEdit, QComboBox, QSplitter,
                               QDialog, QFormLayout, QDialogButtonBox, QMenu,
-                              QSizePolicy)
+                              QMenuBar, QSizePolicy, QMessageBox)
 from PyQt6.QtCore import Qt, QTimer, QPoint, QSettings, QObject
-from PyQt6.QtGui import QAction, QFont, QColor
+from PyQt6.QtGui import QAction, QFont, QColor, QShortcut, QKeySequence
 
 from app.communicators import DeviceCommunicator, LaserCommunicator, PelcoDCommunicator, ONVIFCommunicator
 from app.widgets import (CollapsiblePanel, DirectionPad,
-                          SpeedControl, CameraWidget, SlidingPanel, HAS_CV2)
+                          SpeedControl, CameraWidget, SlidingPanel,
+                          YandexMapWidget, HAS_CV2)
 from app.detector import YoloDetector, FILTER_ALL, FILTER_AIR, FILTER_DRONE_VEHICLE
 from app.styles import (apply_apple_dark_style, STYLE_GO_BUTTON, STYLE_STOP_ALL,
                          STYLE_HOME_BUTTON, STYLE_DIAG_BUTTON, STYLE_LOG_TEXT,
@@ -26,7 +27,7 @@ from app.styles import (apply_apple_dark_style, STYLE_GO_BUTTON, STYLE_STOP_ALL,
 # ═══════════════════════════════════════════════════════════════════
 
 class ConnectionDialog(QDialog):
-    """Generic connection dialog for devices."""
+    """Generic connection dialog for devices with input validation."""
 
     def __init__(self, title, fields, parent=None):
         super().__init__(parent)
@@ -45,12 +46,32 @@ class ConnectionDialog(QDialog):
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok |
             QDialogButtonBox.StandardButton.Cancel)
-        btns.accepted.connect(self.accept)
+        btns.accepted.connect(self._validate_and_accept)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
+    def _validate_and_accept(self):
+        """Validate inputs before accepting."""
+        for label, inp in self.inputs.items():
+            val = inp.text().strip()
+            if not val:
+                QMessageBox.warning(self, "Validation", f"{label} cannot be empty")
+                inp.setFocus()
+                return
+            # Port validation
+            if label.lower().startswith("port"):
+                try:
+                    port = int(val)
+                    if not (1 <= port <= 65535):
+                        raise ValueError
+                except ValueError:
+                    QMessageBox.warning(self, "Validation", f"{label} must be 1-65535")
+                    inp.setFocus()
+                    return
+        self.accept()
+
     def get_values(self):
-        return {k: v.text() for k, v in self.inputs.items()}
+        return {k: v.text().strip() for k, v in self.inputs.items()}
 
 
 class _HideOnCloseFilter(QObject):
@@ -178,6 +199,19 @@ class MainWindow(QMainWindow):
         apply_apple_dark_style(self)
         self._connect_signals()
 
+        # Push saved beam config to map on startup
+        if hasattr(self, 'map_widget'):
+            self.map_widget.apply_saved_config(
+                self._beam_lat,
+                self._beam_lng,
+                self._beam_offset,
+                self._beam_length,
+                0)
+            # Update map toolbar device position label
+            if hasattr(self, '_map_pos_lbl'):
+                self._map_pos_lbl.setText(
+                    f"Device: {self._beam_lat:.4f}, {self._beam_lng:.4f}")
+
         # Status bar
         self.statusBar().showMessage("Ready")
 
@@ -207,6 +241,9 @@ class MainWindow(QMainWindow):
         self._track_timer.setInterval(50)
         self._track_timer.timeout.connect(self._track_control_tick)
 
+        # Keyboard shortcuts
+        self._setup_shortcuts()
+
     # ════════════════ MENU BAR ════════════════
     def _build_menu(self):
         menubar = self.menuBar()
@@ -220,35 +257,33 @@ class MainWindow(QMainWindow):
         act_las.triggered.connect(self._connect_laser_dialog)
         dev_menu.addAction(act_las)
 
-        dev_menu.addSeparator()
-
-        act_cam1 = QAction("CAM1 (IP Camera)...", self)
-        act_cam1.triggered.connect(self._connect_cam1_dialog)
-        dev_menu.addAction(act_cam1)
-
-        act_cam2 = QAction("CAM2 (Thermal)...", self)
-        act_cam2.triggered.connect(self._connect_cam2_dialog)
-        dev_menu.addAction(act_cam2)
-
-        dev_menu.addSeparator()
-
-        act_zoom = QAction("ZOOM Camera (ONVIF)...", self)
-        act_zoom.triggered.connect(self._connect_zoom_dialog)
-        dev_menu.addAction(act_zoom)
-
-        dev_menu.addSeparator()
-
-        act_ret = QAction("Reticle: Crosshair", self)
-        self._reticle_action = act_ret
-        ret_menu = dev_menu.addMenu("Reticle")
-        for name, idx in [("Crosshair", 0), ("Mil-Dot", 1), ("Combat", 2)]:
-            a = QAction(name, self)
-            a.triggered.connect(lambda checked, i=idx: self._set_reticle(i))
-            ret_menu.addAction(a)
-
         # View menu
         view_menu = menubar.addMenu("&View")
         self._view_menu = view_menu
+
+    def _set_reticle(self, idx):
+        if self.cam1_widget:
+            self.cam1_widget.set_reticle(idx)
+        if self.cam2_widget:
+            self.cam2_widget.set_reticle(idx)
+        names = ["Crosshair", "Mil-Dot", "Combat"]
+        self._log(f"[CAM] Reticle: {names[idx]}")
+
+    # ════════════════ KEYBOARD SHORTCUTS ════════════════
+    def _setup_shortcuts(self):
+        """Global keyboard shortcuts for quick access."""
+        shortcuts = [
+            ("Space", self._stop_all),
+            ("H", self._go_home),
+            ("Escape", self._stop_tracking),
+            ("F1", self._toggle_cameras_view),
+            ("F2", self._toggle_map_view),
+            ("F3", self._toggle_log_window),
+        ]
+        for key, fn in shortcuts:
+            sc = QShortcut(QKeySequence(key), self)
+            sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            sc.activated.connect(fn)
 
     # ════════════════ SETTINGS PERSISTENCE ════════════════
     def _load_settings(self):
@@ -271,6 +306,15 @@ class MainWindow(QMainWindow):
         self._onvif_port = int(s.value("onvif_port", self._onvif_port))
         self._onvif_user = s.value("onvif_user", self._onvif_user)
         self._onvif_pass = s.value("onvif_pass", self._onvif_pass)
+        # TILT invert
+        if hasattr(self, 'tilt_invert_cb'):
+            invert = s.value("tilt_invert", "true")
+            self.tilt_invert_cb.setChecked(str(invert).lower() in ("true", "1", "yes"))
+        # Beam config — store as vars for later spinbox init
+        self._beam_lat = float(s.value("beam_lat", 55.751574))
+        self._beam_lng = float(s.value("beam_lng", 37.573856))
+        self._beam_offset = float(s.value("beam_offset", 0.0))
+        self._beam_length = int(s.value("beam_length", 3000))
 
     def _save_settings(self):
         """Save connection parameters to persistent storage."""
@@ -292,9 +336,18 @@ class MainWindow(QMainWindow):
         s.setValue("onvif_port", self._onvif_port)
         s.setValue("onvif_user", self._onvif_user)
         s.setValue("onvif_pass", self._onvif_pass)
+        s.setValue("tilt_invert", self.tilt_invert_cb.isChecked() if hasattr(self, 'tilt_invert_cb') else True)
+        # Beam config
+        s.setValue("beam_lat", self._beam_lat)
+        s.setValue("beam_lng", self._beam_lng)
+        s.setValue("beam_offset", self._beam_offset)
+        s.setValue("beam_length", self._beam_length)
         # Save cameras window geometry
         if hasattr(self, '_cameras_win'):
             s.setValue("cam_win_geometry", self._cameras_win.geometry())
+        # Save map window geometry
+        if hasattr(self, '_map_win'):
+            s.setValue("map_win_geometry", self._map_win.geometry())
 
     # ════════════════ CONNECTION DIALOGS ════════════════
     def _connect_pan_tilt_dialog(self):
@@ -415,8 +468,113 @@ class MainWindow(QMainWindow):
         if self.cam2_widget:
             self.cam2_widget.set_reticle(idx)
         names = ["Crosshair", "Mil-Dot", "Combat"]
-        self._reticle_action.setText(f"Reticle: {names[idx]}")
         self._log(f"[CAM] Reticle: {names[idx]}")
+
+    # ════════════════ CAMERAS WINDOW MENU ════════════════
+    def _build_cameras_menu(self):
+        """Build menu bar inside the cameras floating window."""
+        menubar = QMenuBar(self._cameras_win)
+        menubar.setStyleSheet(
+            "QMenuBar{background:#2d2d2d;border-bottom:1px solid #3c3c3c;}"
+            "QMenuBar::item{color:#98989d;padding:4px 10px;font:600 10px 'SF Pro Display';}"
+            "QMenuBar::item:selected{background:#3a3a3c;color:#f5f5f7;}"
+            "QMenu{background:#2d2d2d;border:1px solid #3c3c3c;}"
+            "QMenu::item{color:#f5f5f7;padding:5px 24px;font:500 11px 'SF Pro Display';}"
+            "QMenu::item:selected{background:#0a84ff;}")
+
+        # ── Connection menu ──
+        conn_menu = menubar.addMenu("Connection")
+        act_cam1 = QAction("CAM1 (IP Camera)...", self._cameras_win)
+        act_cam1.triggered.connect(self._connect_cam1_dialog)
+        conn_menu.addAction(act_cam1)
+
+        act_cam2 = QAction("CAM2 (Thermal)...", self._cameras_win)
+        act_cam2.triggered.connect(self._connect_cam2_dialog)
+        conn_menu.addAction(act_cam2)
+
+        conn_menu.addSeparator()
+
+        act_zoom = QAction("ZOOM Camera (ONVIF)...", self._cameras_win)
+        act_zoom.triggered.connect(self._connect_zoom_dialog)
+        conn_menu.addAction(act_zoom)
+
+        # ── Settings menu ──
+        settings_menu = menubar.addMenu("Settings")
+
+        # Reticle submenu
+        ret_menu = settings_menu.addMenu("Reticle")
+        for name, idx in [("Crosshair", 0), ("Mil-Dot", 1), ("Combat", 2)]:
+            a = QAction(name, self._cameras_win)
+            a.triggered.connect(lambda checked, i=idx: self._set_reticle(i))
+            ret_menu.addAction(a)
+
+        # Detection filter submenu
+        filt_menu = settings_menu.addMenu("Detection Filter")
+        for name, idx in [("All Classes", 0), ("Air Targets", 1), ("Drones + Vehicles", 2)]:
+            a = QAction(name, self._cameras_win)
+            a.triggered.connect(lambda checked, i=idx: self._menu_set_filter(i))
+            filt_menu.addAction(a)
+
+        settings_menu.addSeparator()
+
+        # Zoom speed
+        act_zoom_spd = QAction("Zoom Speed...", self._cameras_win)
+        act_zoom_spd.triggered.connect(self._menu_set_zoom_speed)
+        settings_menu.addAction(act_zoom_spd)
+
+        # Tracking gain
+        act_gain = QAction("Tracking Gain...", self._cameras_win)
+        act_gain.triggered.connect(self._menu_set_track_gain)
+        settings_menu.addAction(act_gain)
+
+        return menubar
+
+    def _menu_set_filter(self, idx):
+        """Set detection filter from cameras menu."""
+        if hasattr(self, 'det_filter_combo'):
+            self.det_filter_combo.setCurrentIndex(idx)
+
+    def _menu_set_zoom_speed(self):
+        """Dialog to set zoom speed percentage."""
+        from PyQt6.QtWidgets import QInputDialog
+        cur = getattr(self, '_zoom_speed', 50)
+        val, ok = QInputDialog.getInt(self, "Zoom Speed", "Zoom speed (%):",
+                                       cur, 10, 100, 5)
+        if ok:
+            self._zoom_speed = val
+
+    def _menu_set_track_gain(self):
+        """Dialog to set tracking gain."""
+        from PyQt6.QtWidgets import QInputDialog
+        val, ok = QInputDialog.getDouble(self, "Tracking Gain", "Proportional gain:",
+                                          self._track_gain, 0.1, 10.0, 2, 0.1)
+        if ok:
+            self._track_gain = val
+
+    def _menu_beam_config(self):
+        """Dialog to set map beam position (called from map window toolbar)."""
+        from PyQt6.QtWidgets import QInputDialog
+        lat, ok = QInputDialog.getDouble(self, "Beam Latitude", "Latitude:",
+                                          getattr(self, '_beam_lat', 55.751574), -90, 90, 6, 0.001)
+        if not ok:
+            return
+        lng, ok = QInputDialog.getDouble(self, "Beam Longitude", "Longitude:",
+                                          getattr(self, '_beam_lng', 37.573856), -180, 180, 6, 0.001)
+        if not ok:
+            return
+        off, ok = QInputDialog.getDouble(self, "Beam Offset", "Offset (deg):",
+                                          getattr(self, '_beam_offset', 0.0), -180, 180, 1, 0.5)
+        if not ok:
+            return
+        length, ok = QInputDialog.getInt(self, "Beam Length", "Length (m):",
+                                          getattr(self, '_beam_length', 3000), 100, 50000, 100)
+        if not ok:
+            return
+        self._beam_lat = lat
+        self._beam_lng = lng
+        self._beam_offset = off
+        self._beam_length = length
+        self._apply_beam_config()
 
     # ════════════════ VIEW TOGGLES ════════════════
     def _toggle_cameras_view(self):
@@ -426,9 +584,36 @@ class MainWindow(QMainWindow):
             self._cameras_win.show()
             self._cameras_win.raise_()
 
-    # ════════════════ RESIZE ════════════════
+    def _toggle_map_view(self):
+        if self._map_win.isVisible():
+            self._map_win.hide()
+        else:
+            self._map_win.show()
+            self._map_win.raise_()
+
+    # ════════════════ RESIZE — responsive auto-collapse ════════════════
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        w = self.width()
+        # Determine desired panel states based on window width
+        if w < 700:
+            left_show, right_show = False, False
+        elif w < 950:
+            left_show, right_show = True, False
+        else:
+            left_show, right_show = True, True
+
+        # Only trigger animation when state actually changes
+        if hasattr(self, 'left_panel'):
+            if left_show and self.left_panel._collapsed:
+                self.left_panel._show()
+            elif not left_show and not self.left_panel._collapsed:
+                self.left_panel._hide()
+        if hasattr(self, 'right_panel'):
+            if right_show and self.right_panel._collapsed:
+                self.right_panel._show()
+            elif not right_show and not self.right_panel._collapsed:
+                self.right_panel._hide()
 
     def closeEvent(self, event):
         self._save_settings()
@@ -448,9 +633,13 @@ class MainWindow(QMainWindow):
         # Destroy YOLO detector
         if hasattr(self, '_detector') and self._detector:
             self._detector.destroy()
-        # Clean up floating cameras window
+        # Clean up floating windows
         if hasattr(self, '_cameras_win'):
             self._cameras_win.deleteLater()
+        if hasattr(self, '_map_win'):
+            self._map_win.deleteLater()
+        if hasattr(self, '_log_win'):
+            self._log_win.deleteLater()
         super().closeEvent(event)
 
     # ════════════════ UI BUILD ════════════════
@@ -499,9 +688,9 @@ class MainWindow(QMainWindow):
         # Speed setting
         spd = CollapsiblePanel("SPEED SETTING")
         spdl = QVBoxLayout()
-        self.pan_speed_ctrl = SpeedControl("PAN SPEED °/s", -50, 50)
+        self.pan_speed_ctrl = SpeedControl("PAN SPEED °/s", 0, 50)
         spdl.addWidget(self.pan_speed_ctrl)
-        self.tilt_speed_ctrl = SpeedControl("TILT SPEED °/s", -20, 20)
+        self.tilt_speed_ctrl = SpeedControl("TILT SPEED °/s", 0, 20)
         spdl.addWidget(self.tilt_speed_ctrl)
         spd.content_layout().addLayout(spdl)
         left.addWidget(spd)
@@ -542,6 +731,11 @@ class MainWindow(QMainWindow):
         diag = CollapsiblePanel("TILT & DIAGNOSTICS")
         dl = QVBoxLayout()
         self.tilt_invert_cb = QCheckBox("Invert TILT axis")
+        self.tilt_invert_cb.setChecked(True)  # default ON
+        # Load saved preference (override default if previously saved)
+        saved_invert = self._settings.value("tilt_invert")
+        if saved_invert is not None:
+            self.tilt_invert_cb.setChecked(str(saved_invert).lower() in ("true", "1", "yes"))
         self.tilt_invert_cb.setStyleSheet("color:#98989d; font:600 11px 'SF Pro Display';")
         dl.addWidget(self.tilt_invert_cb)
         diag_row = QHBoxLayout()
@@ -561,10 +755,10 @@ class MainWindow(QMainWindow):
         self.left_panel.set_content_layout(left)
         root.addWidget(self.left_panel)
 
-        # ─── CENTER — D-Pad only ───
+        # ─── CENTER — Yandex Map ───
         center = QVBoxLayout()
-        center.setContentsMargins(4, 0, 4, 0)
-        center.setSpacing(8)
+        center.setContentsMargins(0, 0, 0, 0)
+        center.setSpacing(0)
 
         # Create camera widgets for the floating cameras window
         self.cam1_widget = CameraWidget("CAM1 — IP")
@@ -593,6 +787,10 @@ class MainWindow(QMainWindow):
             "color:#98989d; font:600 10px 'SF Pro Display'; "
             "background:#2d2d2d; border-bottom:1px solid #3c3c3c;")
         cam_layout.addWidget(cam_hdr)
+
+        # Cameras window menu bar
+        cam_menubar = self._build_cameras_menu()
+        cam_layout.addWidget(cam_menubar)
 
         # Splitter for side-by-side cameras
         cam_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -626,17 +824,81 @@ class MainWindow(QMainWindow):
         act_cams.triggered.connect(self._toggle_cameras_view)
         self._view_menu.addAction(act_cams)
 
-        # D-Pad
-        dpad_panel = CollapsiblePanel("CONTROL PAD")
-        dpad_inner = QHBoxLayout()
-        dpad_inner.addStretch()
-        self.dpad = DirectionPad()
-        self.dpad.direction_pressed.connect(self._on_dpad_pressed)
-        self.dpad.direction_released.connect(self._on_dpad_released)
-        dpad_inner.addWidget(self.dpad)
-        dpad_inner.addStretch()
-        dpad_panel.content_layout().addLayout(dpad_inner)
-        center.addWidget(dpad_panel, 0)
+        # ─── FLOATING MAP WINDOW (draggable, resizable) ───
+        self.map_widget = YandexMapWidget()
+
+        self._map_win = QWidget(self, Qt.WindowType.Window)
+        self._map_win.setWindowTitle("MAP")
+        self._map_win.resize(700, 500)
+        self._map_win.setMinimumSize(300, 200)
+        self._map_win.setStyleSheet("background:#1e1e1e;")
+
+        # Hide on close instead of destroy
+        self._map_close_filter = _HideOnCloseFilter(self._map_win)
+        self._map_win.installEventFilter(self._map_close_filter)
+
+        map_layout = QVBoxLayout(self._map_win)
+        map_layout.setContentsMargins(0, 0, 0, 0)
+        map_layout.setSpacing(0)
+
+        # Title bar
+        map_hdr = QLabel("  MAP")
+        map_hdr.setFixedHeight(28)
+        map_hdr.setStyleSheet(
+            "color:#98989d; font:600 10px 'SF Pro Display'; "
+            "background:#2d2d2d; border-bottom:1px solid #3c3c3c;")
+        map_layout.addWidget(map_hdr)
+
+        # Map toolbar (beam config + device position)
+        map_tb = QWidget()
+        map_tb.setStyleSheet("QWidget{background:#1c1c1e; border-bottom:1px solid #38383a;}")
+        map_tb_h = QHBoxLayout(map_tb)
+        map_tb_h.setContentsMargins(8, 4, 8, 4)
+        map_tb_h.setSpacing(8)
+        beam_btn = QPushButton("BEAM CONFIG")
+        beam_btn.setStyleSheet(
+            "QPushButton{background:#2d2d2d;color:#98989d;border:1px solid #48484a;"
+            "border-radius:4px;padding:3px 12px;font:600 10px 'SF Pro Display';}"
+            "QPushButton:hover{background:#3a3a3c;color:#f5f5f7;border-color:#0a84ff;}")
+        beam_btn.clicked.connect(self._menu_beam_config)
+        map_tb_h.addWidget(beam_btn)
+        self._map_pos_lbl = QLabel("Device: --")
+        self._map_pos_lbl.setStyleSheet("color:#636366; font:500 10px 'SF Pro Display';")
+        map_tb_h.addWidget(self._map_pos_lbl)
+        map_tb_h.addStretch()
+        map_layout.addWidget(map_tb)
+
+        map_layout.addWidget(self.map_widget, 1)
+
+        # Position the map window — avoid overlap with cameras window
+        saved_map_geom = self._settings.value("map_win_geometry")
+        if saved_map_geom and hasattr(saved_map_geom, 'isValid') and saved_map_geom.isValid():
+            self._map_win.setGeometry(saved_map_geom)
+        else:
+            # Place below cameras window if it exists, otherwise next to main
+            if hasattr(self, '_cameras_win'):
+                cam_geo = self._cameras_win.geometry()
+                # Check if cameras window bottom would go off screen
+                cam_bottom = cam_geo.y() + cam_geo.height() + 10
+                screen_h = self.screen().availableGeometry().height() if self.screen() else 900
+                if cam_bottom + 500 > screen_h:
+                    # Place map to the right of cameras window instead
+                    self._map_win.move(cam_geo.x() + cam_geo.width() + 10, cam_geo.y())
+                else:
+                    self._map_win.move(cam_geo.x(), cam_bottom)
+            else:
+                self._map_win.move(
+                    self.pos().x() + self.width() + 20,
+                    self.pos().y() + 420)
+        self._map_win.show()
+
+        # View menu action for map window
+        act_map = QAction("Map Window", self)
+        act_map.triggered.connect(self._toggle_map_view)
+        self._view_menu.addAction(act_map)
+
+        # Add a placeholder to center so it's not empty
+        center.addStretch()
 
         root.addLayout(center, 1)
 
@@ -647,7 +909,19 @@ class MainWindow(QMainWindow):
         right.setContentsMargins(8, 8, 8, 8)
         right.setSpacing(2)
 
-        # Laser rangefinder controls
+        # D-Pad (primary control — always visible at top)
+        dpad_panel = CollapsiblePanel("CONTROL PAD")
+        dpad_inner = QHBoxLayout()
+        dpad_inner.addStretch()
+        self.dpad = DirectionPad()
+        self.dpad.direction_pressed.connect(self._on_dpad_pressed)
+        self.dpad.direction_released.connect(self._on_dpad_released)
+        dpad_inner.addWidget(self.dpad)
+        dpad_inner.addStretch()
+        dpad_panel.content_layout().addLayout(dpad_inner)
+        right.addWidget(dpad_panel)
+
+        # Laser rangefinder controls (compact)
         laser = CollapsiblePanel("LASER RANGEFINDER")
         las = QVBoxLayout()
         self.laser_dist_lbl = QLabel("---.- m")
@@ -672,52 +946,17 @@ class MainWindow(QMainWindow):
         las_diag_btn = QPushButton("SELF-CHECK")
         las_diag_btn.clicked.connect(self._laser_selfcheck)
         las.addWidget(las_diag_btn)
+        las_connect_btn = QPushButton("CONNECT")
+        las_connect_btn.setStyleSheet(
+            "QPushButton{background:#2d2d2d;color:#98989d;border:1px solid #48484a;"
+            "border-radius:4px;padding:3px 8px;font:600 10px 'SF Pro Display';}"
+            "QPushButton:hover{background:#3a3a3c;color:#f5f5f7;border-color:#30d158;}")
+        las_connect_btn.clicked.connect(self._connect_laser_dialog)
+        las.addWidget(las_connect_btn)
         laser.content_layout().addLayout(las)
         right.addWidget(laser)
 
-        # Zoom camera (Pelco-D)
-        zoom = CollapsiblePanel("ZOOM CAMERA")
-        zl = QVBoxLayout()
-        zoom_row = QHBoxLayout()
-        self.zoom_tele_btn = QPushButton("TELE +")
-        self.zoom_tele_btn.setStyleSheet(STYLE_GO_BUTTON)
-        self.zoom_tele_btn.pressed.connect(self._zoom_tele)
-        self.zoom_tele_btn.released.connect(self._zoom_stop)
-        zoom_row.addWidget(self.zoom_tele_btn)
-        self.zoom_wide_btn = QPushButton("WIDE −")
-        self.zoom_wide_btn.setStyleSheet(STYLE_DIAG_BUTTON)
-        self.zoom_wide_btn.pressed.connect(self._zoom_wide)
-        self.zoom_wide_btn.released.connect(self._zoom_stop)
-        zoom_row.addWidget(self.zoom_wide_btn)
-        zl.addLayout(zoom_row)
-        self.zoom_speed_spin = QSpinBox()
-        self.zoom_speed_spin.setRange(10, 100)
-        self.zoom_speed_spin.setValue(50)
-        self.zoom_speed_spin.setSuffix(" %")
-        self.zoom_speed_spin.setToolTip("Zoom speed: 10-100%")
-        zl.addWidget(self.zoom_speed_spin)
-        zoom_stop_btn = QPushButton("ZOOM STOP")
-        zoom_stop_btn.setStyleSheet(STYLE_STOP_ALL)
-        zoom_stop_btn.clicked.connect(self._zoom_stop)
-        zl.addWidget(zoom_stop_btn)
-        focus_row = QHBoxLayout()
-        self.focus_near_btn = QPushButton("NEAR")
-        self.focus_near_btn.setStyleSheet(STYLE_DIAG_BUTTON)
-        self.focus_near_btn.pressed.connect(self._focus_near)
-        self.focus_near_btn.released.connect(self._focus_stop)
-        focus_row.addWidget(self.focus_near_btn)
-        self.focus_far_btn = QPushButton("FAR")
-        self.focus_far_btn.setStyleSheet(STYLE_DIAG_BUTTON)
-        self.focus_far_btn.pressed.connect(self._focus_far)
-        self.focus_far_btn.released.connect(self._focus_stop)
-        focus_row.addWidget(self.focus_far_btn)
-        zl.addLayout(focus_row)
-        self.focus_auto_btn = QPushButton("AUTO FOCUS")
-        self.focus_auto_btn.setStyleSheet(STYLE_DIAG_BUTTON)
-        self.focus_auto_btn.clicked.connect(self._focus_auto)
-        zl.addWidget(self.focus_auto_btn)
-        zoom.content_layout().addLayout(zl)
-        right.addWidget(zoom)
+        # (ZOOM CAMERA moved to Cameras window toolbar — see _build_zoom_toolbar)
 
         # ── DETECTION ──
         det_panel = CollapsiblePanel("DETECTION")
@@ -776,44 +1015,126 @@ class MainWindow(QMainWindow):
         det_panel.content_layout().addLayout(dt)
         right.addWidget(det_panel)
 
-        # Device state
-        st = CollapsiblePanel("DEVICE STATE")
-        sg = QGridLayout()
-        sg.setSpacing(4)
-        self.pan_pos_lbl = QLabel("0.00°")
-        self.tilt_pos_lbl = QLabel("0.00°")
-        self.pan_spd_lbl = QLabel("0.0 °/s")
-        self.tilt_spd_lbl = QLabel("0.0 °/s")
-        self.temp_lbl = QLabel("-- °C")
-        self.action_lbl = QLabel("IDLE")
-        for i, (name, val) in enumerate([
-            ("PAN:", self.pan_pos_lbl), ("TILT:", self.tilt_pos_lbl),
-            ("PAN SPD:", self.pan_spd_lbl), ("TILT SPD:", self.tilt_spd_lbl),
-            ("TEMP:", self.temp_lbl), ("STATUS:", self.action_lbl),
-        ]):
-            nl = QLabel(name)
-            nl.setStyleSheet("color:#636366; font:10px 'SF Pro Display';")
-            val.setStyleSheet("color:#f5f5f7; font:600 11px 'SF Pro Display';")
-            sg.addWidget(nl, i, 0)
-            sg.addWidget(val, i, 1)
-        st.content_layout().addLayout(sg)
-        right.addWidget(st)
-
-        # Log
-        lg = CollapsiblePanel("PROTOCOL LOG")
-        ll = QVBoxLayout()
-        self.log_text = QPlainTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setMaximumBlockCount(50)
-        self.log_text.setStyleSheet(STYLE_LOG_TEXT)
-        self.log_text.setFixedHeight(200)
-        ll.addWidget(self.log_text)
-        lg.content_layout().addLayout(ll)
-        right.addWidget(lg)
+        # (MAP BEAM, DEVICE STATE, PROTOCOL LOG moved out of right panel)
 
         right.addStretch()
         self.right_panel.set_content_layout(right)
         root.addWidget(self.right_panel)
+
+        # ─── DEVICE STATE — compact inline bar at bottom ───
+        self._build_device_state_bar()
+
+        # ─── FLOATING LOG WINDOW ───
+        self._build_log_window()
+
+        # ─── ZOOM CONTROLS — in cameras window toolbar ───
+        self._build_zoom_toolbar()
+
+    # ════════════════ BUILDER HELPERS ════════════════
+
+    def _build_device_state_bar(self):
+        """Compact inline device state bar at bottom of main window."""
+        bar = QFrame()
+        bar.setStyleSheet("QFrame{background:#1c1c1e; border-top:1px solid #38383a;}")
+        bar.setFixedHeight(28)
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(12, 2, 12, 2)
+        h.setSpacing(16)
+        _lbl_font = "font:600 10px 'SF Pro Display'"
+        self.pan_pos_lbl = QLabel("PAN: 0.00\u00b0")
+        self.tilt_pos_lbl = QLabel("TILT: 0.00\u00b0")
+        self.pan_spd_lbl = QLabel("P-SPD: 0.0")
+        self.tilt_spd_lbl = QLabel("T-SPD: 0.0")
+        self.temp_lbl = QLabel("TEMP: --")
+        self.action_lbl = QLabel("IDLE")
+        for lbl in (self.pan_pos_lbl, self.tilt_pos_lbl, self.pan_spd_lbl,
+                    self.tilt_spd_lbl, self.temp_lbl, self.action_lbl):
+            lbl.setStyleSheet(f"color:#8e8e93; {_lbl_font};")
+            h.addWidget(lbl)
+        h.addStretch()
+        self.statusBar().addPermanentWidget(bar)
+
+    def _build_log_window(self):
+        """Floating protocol log window (toggle from View menu)."""
+        self._log_win = QFrame(self)
+        self._log_win.setWindowFlags(Qt.WindowType.Window)
+        self._log_win.setWindowTitle("Protocol Log")
+        self._log_win.setStyleSheet(
+            "QFrame{background:#1c1c1e;}"
+            "QFrame#logFrame{background:#0a0a0a; border:1px solid #38383a; border-radius:6px;}")
+        self._log_win.setFixedSize(420, 300)
+        vl = QVBoxLayout(self._log_win)
+        vl.setContentsMargins(8, 8, 8, 8)
+        inner = QFrame()
+        inner.setObjectName("logFrame")
+        il = QVBoxLayout(inner)
+        self.log_text = QPlainTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumBlockCount(50)
+        self.log_text.setStyleSheet(STYLE_LOG_TEXT)
+        il.addWidget(self.log_text)
+        vl.addWidget(inner)
+        self._log_close_filter = _HideOnCloseFilter(self._log_win)
+        self._log_win.installEventFilter(self._log_close_filter)
+        # Add to View menu
+        self._log_action = QAction("Protocol Log", self)
+        self._log_action.setCheckable(True)
+        self._log_action.triggered.connect(self._toggle_log_window)
+        if hasattr(self, '_view_menu'):
+            self._view_menu.addAction(self._log_action)
+
+    def _toggle_log_window(self):
+        if self._log_win.isVisible():
+            self._log_win.hide()
+            self._log_action.setChecked(False)
+        else:
+            self._log_win.move(self.x() + 200, self.y() + 200)
+            self._log_win.show()
+            self._log_win.raise_()
+            self._log_action.setChecked(True)
+
+    def _build_zoom_toolbar(self):
+        """Zoom controls placed as toolbar inside the cameras floating window."""
+        self._zoom_speed = 50  # default zoom speed %
+        if not hasattr(self, '_cameras_win'):
+            return
+        tb = QWidget()
+        tb.setStyleSheet("QWidget{background:#1c1c1e; border:1px solid #38383a; border-radius:6px;}")
+        h = QHBoxLayout(tb)
+        h.setContentsMargins(8, 4, 8, 4)
+        h.setSpacing(6)
+        lbl = QLabel("ZOOM")
+        lbl.setStyleSheet("color:#8e8e93; font:600 10px 'SF Pro Display';")
+        h.addWidget(lbl)
+        self.zoom_tele_btn = QPushButton("TELE +")
+        self.zoom_tele_btn.setStyleSheet(STYLE_GO_BUTTON)
+        self.zoom_tele_btn.pressed.connect(self._zoom_tele)
+        self.zoom_tele_btn.released.connect(self._zoom_stop)
+        h.addWidget(self.zoom_tele_btn)
+        self.zoom_wide_btn = QPushButton("WIDE \u2212")
+        self.zoom_wide_btn.setStyleSheet(STYLE_DIAG_BUTTON)
+        self.zoom_wide_btn.pressed.connect(self._zoom_wide)
+        self.zoom_wide_btn.released.connect(self._zoom_stop)
+        h.addWidget(self.zoom_wide_btn)
+        # Focus
+        self.focus_near_btn = QPushButton("NEAR")
+        self.focus_near_btn.setStyleSheet(STYLE_DIAG_BUTTON)
+        self.focus_near_btn.pressed.connect(self._focus_near)
+        self.focus_near_btn.released.connect(self._focus_stop)
+        h.addWidget(self.focus_near_btn)
+        self.focus_far_btn = QPushButton("FAR")
+        self.focus_far_btn.setStyleSheet(STYLE_DIAG_BUTTON)
+        self.focus_far_btn.pressed.connect(self._focus_far)
+        self.focus_far_btn.released.connect(self._focus_stop)
+        h.addWidget(self.focus_far_btn)
+        self.focus_auto_btn = QPushButton("AUTO FOCUS")
+        self.focus_auto_btn.setStyleSheet(STYLE_DIAG_BUTTON)
+        self.focus_auto_btn.clicked.connect(self._focus_auto)
+        h.addWidget(self.focus_auto_btn)
+        # Insert into cameras window layout (after the splitter, before buttons)
+        cam_layout = self._cameras_win.layout()
+        if cam_layout is not None:
+            cam_layout.addWidget(tb)
 
     # ════════════════ SIGNALS ════════════════
     def _connect_signals(self):
@@ -850,27 +1171,29 @@ class MainWindow(QMainWindow):
     # ════════════════ CALLBACKS ════════════════
     def _on_real_pan(self, v):
         self.real_pan = v
-        self.pan_pos_lbl.setText(f"{v:.2f}°")
+        self.pan_pos_lbl.setText(f"PAN: {v:.2f}\u00b0")
+        if hasattr(self, 'map_widget'):
+            self.map_widget.set_pan_angle(v)
 
     def _on_real_tilt(self, v):
         self.real_tilt = v
-        self.tilt_pos_lbl.setText(f"{v:.2f}°")
+        self.tilt_pos_lbl.setText(f"TILT: {v:.2f}\u00b0")
 
     def _on_real_pan_spd(self, v):
         self.real_pan_spd = v
-        self.pan_spd_lbl.setText(f"{v:.1f} °/s")
+        self.pan_spd_lbl.setText(f"P-SPD: {v:.1f}")
         self.action_lbl.setText("MOVING" if abs(v) > 0.1 else "IDLE")
         self.action_lbl.setStyleSheet(
-            f"color:{COLOR_ACTIVE};font:600 11px 'SF Pro Display';" if abs(v) > 0.1
-            else "color:#f5f5f7;font:600 11px 'SF Pro Display';")
+            f"color:{COLOR_ACTIVE};font:600 10px 'SF Pro Display';" if abs(v) > 0.1
+            else "color:#8e8e93;font:600 10px 'SF Pro Display';")
 
     def _on_real_tilt_spd(self, v):
         self.real_tilt_spd = v
-        self.tilt_spd_lbl.setText(f"{v:.1f} °/s")
+        self.tilt_spd_lbl.setText(f"T-SPD: {v:.1f}")
 
     def _on_real_temp(self, v):
         self.real_temp = v
-        self.temp_lbl.setText(f"{v:.1f} °C")
+        self.temp_lbl.setText(f"TEMP: {v:.1f}")
 
     def _on_connection(self, connected):
         self.is_connected = connected
@@ -894,15 +1217,17 @@ class MainWindow(QMainWindow):
         s = "ON" if connected else "OFF"
         self.zoom_status_lbl.setText(f"● ZOOM: {s}")
         self.zoom_status_lbl.set_status_style(f"color:{c}; {self._LBL_FONT}")
-        self._log(f"[ZOOM] {'Connected' if connected else 'Disconnected'}")
+        self._log(f"[PELCO] {'Connected' if connected else 'Disconnected'}")
 
     def _on_onvif_connection(self, connected):
         self.onvif_connected = connected
-        c = COLOR_CONNECTED if connected else COLOR_DISCONNECTED
-        s = "ON" if connected else "OFF"
-        self.zoom_status_lbl.setText(f"● ZOOM: {s}")
-        self.zoom_status_lbl.set_status_style(f"color:{c}; {self._LBL_FONT}")
-        self._log(f"[ZOOM] ONVIF {'Connected' if connected else 'Disconnected'}")
+        # Only update ZOOM label if Pelco is not connected (Pelco takes priority)
+        if not self.pelco_connected:
+            c = COLOR_CONNECTED if connected else COLOR_DISCONNECTED
+            s = "ON" if connected else "OFF"
+            self.zoom_status_lbl.setText(f"● ZOOM: {s}")
+            self.zoom_status_lbl.set_status_style(f"color:{c}; {self._LBL_FONT}")
+        self._log(f"[ONVIF] {'Connected' if connected else 'Disconnected'}")
 
     # ════════════════ ACTIONS ════════════════
     def _get_tilt_sign(self):
@@ -1078,6 +1403,22 @@ class MainWindow(QMainWindow):
         else:
             self._log("[LASER] Self-check: no response")
 
+    # ════════════════ MAP BEAM CONFIG ════════════════
+    def _apply_beam_config(self):
+        """Apply MAP BEAM settings to the map widget."""
+        if not hasattr(self, 'map_widget'):
+            return
+        lat = self._beam_lat
+        lng = self._beam_lng
+        offset = self._beam_offset
+        length = self._beam_length
+        self.map_widget.set_device_position(lat, lng)
+        self.map_widget.set_beam_offset(offset)
+        self.map_widget.set_beam_length(length)
+        if hasattr(self, '_map_pos_lbl'):
+            self._map_pos_lbl.setText(f"Device: {lat:.4f}, {lng:.4f}")
+        self._log(f"[MAP] Beam: {lat:.6f},{lng:.6f} offset={offset:.1f}\u00b0 len={length}m")
+
     # ════════════════ ZOOM (ONVIF) ════════════════
     def _ensure_onvif_connected(self):
         """Auto-connect ONVIF if not connected, then return status."""
@@ -1090,14 +1431,14 @@ class MainWindow(QMainWindow):
     def _zoom_tele(self):
         if not self._ensure_onvif_connected():
             return
-        spd = self.zoom_speed_spin.value() / 100.0
+        spd = self._zoom_speed / 100.0
         self.onvif_comm.zoom_in(spd)
         self._log(f"[ZOOM] Tele (in) speed={spd:.2f}")
 
     def _zoom_wide(self):
         if not self._ensure_onvif_connected():
             return
-        spd = self.zoom_speed_spin.value() / 100.0
+        spd = self._zoom_speed / 100.0
         self.onvif_comm.zoom_out(spd)
         self._log(f"[ZOOM] Wide (out) speed={spd:.2f}")
 
@@ -1110,14 +1451,14 @@ class MainWindow(QMainWindow):
     def _focus_near(self):
         if not self._ensure_onvif_connected():
             return
-        spd = self.zoom_speed_spin.value() / 100.0
+        spd = self._zoom_speed / 100.0
         self.onvif_comm.focus_near(spd)
         self._log(f"[ZOOM] Focus Near speed={spd:.2f}")
 
     def _focus_far(self):
         if not self._ensure_onvif_connected():
             return
-        spd = self.zoom_speed_spin.value() / 100.0
+        spd = self._zoom_speed / 100.0
         self.onvif_comm.focus_far(spd)
         self._log(f"[ZOOM] Focus Far speed={spd:.2f}")
 
@@ -1137,7 +1478,7 @@ class MainWindow(QMainWindow):
         """Handle mouse wheel zoom on camera video: +1=tele, -1=wide."""
         if not self._ensure_onvif_connected():
             return
-        spd = self.zoom_speed_spin.value() / 100.0
+        spd = self._zoom_speed / 100.0
         if direction > 0:
             self.onvif_comm.zoom_in(spd)
             self._log(f"[ZOOM] Scroll→Tele speed={spd:.2f}")
@@ -1396,17 +1737,17 @@ class MainWindow(QMainWindow):
         # Calculate proportional speeds
         base_pan = self.pan_speed_ctrl.get_speed()
         base_tilt = self.tilt_speed_ctrl.get_speed()
-        if abs(base_pan) < 0.1:
+        if base_pan < 0.1:
             base_pan = 20.0
-        if abs(base_tilt) < 0.1:
+        if base_tilt < 0.1:
             base_tilt = 10.0
 
-        pan_spd = dx * self._track_gain * abs(base_pan)
-        tilt_spd = -dy * self._track_gain * abs(base_tilt)
+        pan_spd = dx * self._track_gain * base_pan
+        tilt_spd = -dy * self._track_gain * base_tilt
 
         # Clamp
-        pan_spd = max(-abs(base_pan), min(abs(base_pan), pan_spd))
-        tilt_spd = max(-abs(base_tilt), min(abs(base_tilt), tilt_spd))
+        pan_spd = max(-base_pan, min(base_pan, pan_spd))
+        tilt_spd = max(-base_tilt, min(base_tilt, tilt_spd))
 
         if self.is_connected:
             tilt_sign = self._get_tilt_sign()
@@ -1466,19 +1807,19 @@ class MainWindow(QMainWindow):
             return
         pan_spd = self.pan_speed_ctrl.get_speed()
         tilt_spd = self.tilt_speed_ctrl.get_speed()
-        if abs(pan_spd) < 0.1:
+        if pan_spd < 0.1:
             pan_spd = 20.0
-        if abs(tilt_spd) < 0.1:
+        if tilt_spd < 0.1:
             tilt_spd = 10.0
         dir_map = {
-            'UP':         (0.0,           tilt_spd),
-            'DOWN':       (0.0,          -tilt_spd),
-            'LEFT':       (-abs(pan_spd),  0.0),
-            'RIGHT':      (abs(pan_spd),   0.0),
-            'UP_RIGHT':   (abs(pan_spd),   tilt_spd),
-            'UP_LEFT':    (-abs(pan_spd),  tilt_spd),
-            'DOWN_RIGHT': (abs(pan_spd),  -tilt_spd),
-            'DOWN_LEFT':  (-abs(pan_spd), -tilt_spd),
+            'UP':         (0.0,      tilt_spd),
+            'DOWN':       (0.0,     -tilt_spd),
+            'LEFT':       (-pan_spd,  0.0),
+            'RIGHT':      (pan_spd,   0.0),
+            'UP_RIGHT':   (pan_spd,   tilt_spd),
+            'UP_LEFT':    (-pan_spd,  tilt_spd),
+            'DOWN_RIGHT': (pan_spd,  -tilt_spd),
+            'DOWN_LEFT':  (-pan_spd, -tilt_spd),
         }
         p_spd, t_spd = dir_map.get(d, (0, 0))
         if self.is_connected:
@@ -1521,16 +1862,19 @@ class MainWindow(QMainWindow):
             self.sim_pan = (self.sim_pan + self.sim_pan_spd * dt) % 360
         if abs(self.sim_tilt_spd) > 0.01:
             self.sim_tilt = max(-90, min(45, self.sim_tilt + self.sim_tilt_spd * dt))
-        self.pan_pos_lbl.setText(f"{self.sim_pan:.2f}°")
-        self.tilt_pos_lbl.setText(f"{self.sim_tilt:.2f}°")
-        self.pan_spd_lbl.setText(f"{self.sim_pan_spd:.1f} °/s")
-        self.tilt_spd_lbl.setText(f"{self.sim_tilt_spd:.1f} °/s")
-        self.temp_lbl.setText("25.0 °C")
+        self.pan_pos_lbl.setText(f"PAN: {self.sim_pan:.2f}\u00b0")
+        self.tilt_pos_lbl.setText(f"TILT: {self.sim_tilt:.2f}\u00b0")
+        # Push sim PAN to map beam
+        if hasattr(self, 'map_widget'):
+            self.map_widget.set_pan_angle(self.sim_pan)
+        self.pan_spd_lbl.setText(f"P-SPD: {self.sim_pan_spd:.1f}")
+        self.tilt_spd_lbl.setText(f"T-SPD: {self.sim_tilt_spd:.1f}")
+        self.temp_lbl.setText("TEMP: 25.0")
         moving = abs(self.sim_pan_spd) > 0.1 or abs(self.sim_tilt_spd) > 0.1
         self.action_lbl.setText("MOVING" if moving else "IDLE")
         self.action_lbl.setStyleSheet(
-            f"color:{COLOR_ACTIVE};font:600 11px 'SF Pro Display';" if moving
-            else "color:#f5f5f7;font:600 11px 'SF Pro Display';")
+            f"color:{COLOR_ACTIVE};font:600 10px 'SF Pro Display';" if moving
+            else "color:#8e8e93;font:600 10px 'SF Pro Display';")
 
     # ════════════════ LOG ════════════════
     def _log(self, msg):

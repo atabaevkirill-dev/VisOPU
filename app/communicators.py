@@ -43,7 +43,7 @@ class DeviceCommunicator(QObject):
         if self.socket:
             try:
                 self.socket.close()
-            except:
+            except Exception:
                 pass
             self.socket = None
         self.connected = False
@@ -65,6 +65,7 @@ class DeviceCommunicator(QObject):
 
     def start_polling(self):
         self.polling = True
+        self._consecutive_failures = 0
         self.poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self.poll_thread.start()
 
@@ -74,35 +75,55 @@ class DeviceCommunicator(QObject):
             self.poll_thread.join(timeout=2)
 
     def _poll_loop(self):
+        """Batch poll all 5 registers per cycle with short inter-command delay."""
+        _commands = [
+            ("$o#", "pan_pos"),
+            ("$O#", "tilt_pos"),
+            ("$p#", "pan_spd"),
+            ("$P#", "tilt_spd"),
+            ("$t#", "temp"),
+        ]
         while self.polling and self.connected:
-            try:
-                resp = self.send_command("$o#")
-                if resp and resp.startswith("$o,"):
-                    val = float(resp.split(",")[1].rstrip("#"))
-                    self.pan_position_updated.emit(val)
-
-                resp = self.send_command("$O#")
-                if resp and resp.startswith("$O,"):
-                    val = float(resp.split(",")[1].rstrip("#"))
-                    self.tilt_position_updated.emit(val)
-
-                resp = self.send_command("$p#")
-                if resp and resp.startswith("$p,"):
-                    val = float(resp.split(",")[1].rstrip("#"))
-                    self.pan_speed_updated.emit(val)
-
-                resp = self.send_command("$P#")
-                if resp and resp.startswith("$P,"):
-                    val = float(resp.split(",")[1].rstrip("#"))
-                    self.tilt_speed_updated.emit(val)
-
-                resp = self.send_command("$t#")
-                if resp and resp.startswith("$t,"):
-                    val = float(resp.split(",")[1].rstrip("#"))
-                    self.temperature_updated.emit(val)
-            except Exception:
-                pass
-            time.sleep(0.25)
+            cycle_ok = True
+            for cmd, kind in _commands:
+                if not self.polling or not self.connected:
+                    break
+                try:
+                    resp = self.send_command(cmd)
+                    prefix = cmd.replace("#", ",")
+                    if resp and len(resp) > 2 and resp.startswith(prefix):
+                        val = float(resp.split(",")[1].rstrip("#"))
+                        if kind == "pan_pos":
+                            self.pan_position_updated.emit(val)
+                        elif kind == "tilt_pos":
+                            self.tilt_position_updated.emit(val)
+                        elif kind == "pan_spd":
+                            self.pan_speed_updated.emit(val)
+                        elif kind == "tilt_spd":
+                            self.tilt_speed_updated.emit(val)
+                        elif kind == "temp":
+                            self.temperature_updated.emit(val)
+                    else:
+                        cycle_ok = False
+                except Exception:
+                    cycle_ok = False
+                time.sleep(0.04)  # short inter-command gap
+            # Auto-reconnect: after 8 consecutive failed cycles, try reconnecting
+            if not cycle_ok:
+                self._consecutive_failures = getattr(self, '_consecutive_failures', 0) + 1
+            else:
+                self._consecutive_failures = 0
+            if self._consecutive_failures >= 8:
+                self._consecutive_failures = 0
+                try:
+                    if self.socket:
+                        self.socket.close()
+                except Exception:
+                    pass
+                self.socket = None
+                self.connected = False
+                self.connection_changed.emit(False)
+            time.sleep(0.05)
 
     def pan_set_speed(self, speed):
         self.send_command(f"$w,{speed:.2f}#")
@@ -178,7 +199,7 @@ class LaserCommunicator(QObject):
         if self.socket:
             try:
                 self.socket.close()
-            except:
+            except Exception:
                 pass
             self.socket = None
         self.connected = False
@@ -292,7 +313,7 @@ class PelcoDCommunicator(QObject):
         if self.socket:
             try:
                 self.socket.close()
-            except:
+            except Exception:
                 pass
             self.socket = None
         self.connected = False
@@ -492,23 +513,28 @@ class ONVIFCommunicator(QObject):
             self.error_occurred.emit(f"Stop: {e}")
 
     def focus_near(self, speed=0.5):
-        """Focus near. speed: 0.0-1.0."""
+        """Focus near via ONVIF Move operation."""
         if not self.connected or not self._ptz:
             return
         try:
             speed = max(0.0, min(1.0, speed))
             request = self._ptz.create_type('ContinuousMove')
             request.ProfileToken = self._profile_token
-
+            request.Velocity = {'PanTilt': {'x': 0, 'y': 0}, 'Zoom': {'x': speed}}
+            self._ptz.ContinuousMove(request)
         except Exception as e:
             self.error_occurred.emit(f"FocusNear: {e}")
 
     def focus_far(self, speed=0.5):
-        """Focus far. speed: 0.0-1.0."""
+        """Focus far via ONVIF Move operation."""
         if not self.connected or not self._ptz:
             return
         try:
             speed = max(0.0, min(1.0, speed))
+            request = self._ptz.create_type('ContinuousMove')
+            request.ProfileToken = self._profile_token
+            request.Velocity = {'PanTilt': {'x': 0, 'y': 0}, 'Zoom': {'x': -speed}}
+            self._ptz.ContinuousMove(request)
         except Exception as e:
             self.error_occurred.emit(f"FocusFar: {e}")
 
