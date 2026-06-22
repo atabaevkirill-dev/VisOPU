@@ -1,0 +1,23 @@
+# ═══════════════════════════════════════════════════════════════════
+# VisOPU — Python Dependencies
+# ═══════════════════════════════════════════════════════════════════
+# Install:  pip install -r requirements.txt
+# Build:    pip install pyinstaller && pyinstaller VisOPU.spec --clean --noconfirm
+
+# ── Core UI ──
+PyQt6>=6.5
+PyQt6-WebEngine>=6.5
+
+# ── Computer Vision ──
+opencv-python>=4.8
+numpy>=1.24
+
+# ── Object Detection (YOLO) ──
+ultralytics>=8.0
+
+# ── ONVIF Camera Control (optional — for IP camera zoom/focus) ──
+onvif-zeep>=0.2.12
+lxml>=4.9
+
+# ── Build (not required at runtime) ──
+# pyinstaller>=6.0

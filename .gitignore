@@ -1,0 +1,55 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+*.spec.bak
+
+# ── Virtual environments ──
+.venv/
+venv/
+env/
+
+# ── IDE ──
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── Model weights (too large for GitHub) ──
+*.pt
+*.onnx
+*.pth
+*.weights
+
+# ── Build artifacts ──
+*.exe
+*.dll
+*.pyd
+
+# ── Logs ──
+*.log
+
+# ── OS ──
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# ── Data ──
+data/
+coord.txt
+pdf_text.txt
+
+# ── Documentation assets (keep only what's in README) ──
+*.gif
+
+# ── PDFs (reference docs, not source code) ──
+*.pdf
+
+# ── PyInstaller ──
+*.manifest

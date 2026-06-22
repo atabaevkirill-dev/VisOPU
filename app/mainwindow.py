@@ -194,6 +194,12 @@ class MainWindow(QMainWindow):
         self.sim_pan_spd = 0.0
         self.sim_tilt_spd = 0.0
 
+        # Keyboard movement state (arrow keys + Q/E zoom)
+        self._held_keys = set()  # currently held movement keys
+        self._kb_zoom_timer = QTimer()
+        self._kb_zoom_timer.setSingleShot(True)
+        self._kb_zoom_timer.timeout.connect(self._zoom_stop)
+
         self._build_menu()
         self._build_ui()
         apply_apple_dark_style(self)
@@ -284,6 +290,101 @@ class MainWindow(QMainWindow):
             sc = QShortcut(QKeySequence(key), self)
             sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
             sc.activated.connect(fn)
+
+    # ════════════════ KEYBOARD PAN/TILT/ZOOM ════════════════
+    _MOVE_KEYS = {
+        Qt.Key.Key_Left, Qt.Key.Key_Right,
+        Qt.Key.Key_Up, Qt.Key.Key_Down,
+        Qt.Key.Key_Q, Qt.Key.Key_E,
+    }
+
+    def keyPressEvent(self, event):
+        """Arrow keys = pan/tilt, Q/E = zoom. Hold to move, release to stop."""
+        key = event.key()
+        if key in self._MOVE_KEYS:
+            if event.isAutoRepeat():
+                return  # ignore OS auto-repeat
+            self._held_keys.add(key)
+            self._apply_keyboard_movement()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        """Stop axis when its keys are released."""
+        key = event.key()
+        if key in self._MOVE_KEYS:
+            if event.isAutoRepeat():
+                return
+            self._held_keys.discard(key)
+            self._apply_keyboard_movement()
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
+
+    def _apply_keyboard_movement(self):
+        """Read _held_keys and send pan/tilt/zoom commands."""
+        h = self._held_keys
+
+        # ── PAN (Left / Right arrows) ──
+        pan_left = Qt.Key.Key_Left in h
+        pan_right = Qt.Key.Key_Right in h
+        pan_spd = self.pan_speed_ctrl.get_speed()
+        if pan_spd < 0.1:
+            pan_spd = 20.0
+
+        if pan_left and not pan_right:
+            if self.is_connected:
+                self.comm.pan_set_speed(-pan_spd)
+            self.sim_pan_spd = -pan_spd
+        elif pan_right and not pan_left:
+            if self.is_connected:
+                self.comm.pan_set_speed(pan_spd)
+            self.sim_pan_spd = pan_spd
+        else:
+            # neither or both → stop pan
+            if self.is_connected and not (pan_left and pan_right):
+                self.comm.pan_stop()
+            if not (pan_left or pan_right):
+                self.sim_pan_spd = 0.0
+
+        # ── TILT (Up / Down arrows) ──
+        tilt_up = Qt.Key.Key_Up in h
+        tilt_down = Qt.Key.Key_Down in h
+        tilt_spd = self.tilt_speed_ctrl.get_speed()
+        if tilt_spd < 0.1:
+            tilt_spd = 10.0
+        tilt_sign = self._get_tilt_sign()
+
+        if tilt_up and not tilt_down:
+            if self.is_connected:
+                self.comm.tilt_set_speed(tilt_spd * tilt_sign)
+            self.sim_tilt_spd = tilt_spd
+        elif tilt_down and not tilt_up:
+            if self.is_connected:
+                self.comm.tilt_set_speed(-tilt_spd * tilt_sign)
+            self.sim_tilt_spd = -tilt_spd
+        else:
+            if self.is_connected and not (tilt_up and tilt_down):
+                self.comm.tilt_stop()
+            if not (tilt_up or tilt_down):
+                self.sim_tilt_spd = 0.0
+
+        # ── ZOOM (Q = wide/out, E = tele/in) ──
+        zoom_in = Qt.Key.Key_E in h
+        zoom_out = Qt.Key.Key_Q in h
+        if zoom_in and not zoom_out:
+            if self._ensure_onvif_connected():
+                spd = self._zoom_speed / 100.0
+                self.onvif_comm.zoom_in(spd)
+                self._kb_zoom_timer.start(300)
+        elif zoom_out and not zoom_in:
+            if self._ensure_onvif_connected():
+                spd = self._zoom_speed / 100.0
+                self.onvif_comm.zoom_out(spd)
+                self._kb_zoom_timer.start(300)
+        elif not zoom_in and not zoom_out:
+            pass  # zoom stop handled by _kb_zoom_timer timeout
 
     # ════════════════ SETTINGS PERSISTENCE ════════════════
     def _load_settings(self):
@@ -447,7 +548,8 @@ class MainWindow(QMainWindow):
         else:
             ok = widget.connect_stream(url, is_thermal)
             if ok:
-                self._log(f"[CAM] CAM{cam_idx} connected: {url}")
+                self._log(f"[CAM] CAM{cam_idx} connected: {url}"
+                          + (f" [THERMAL MODE]" if is_thermal else ""))
                 # Show and raise cameras window
                 self._cameras_win.show()
                 self._cameras_win.raise_()
@@ -1167,6 +1269,10 @@ class MainWindow(QMainWindow):
             cam.video_detect_toggled.connect(self._on_video_detect)
             cam.video_track_toggled.connect(self._on_video_track)
             cam.video_filter_changed.connect(self._on_video_filter)
+        # Thermal camera signals (CAM2)
+        self.cam2_widget.thermal_palette_changed.connect(
+            lambda name: self._log(f"[THERMAL] Palette: {name}"))
+        self.cam2_widget.thermal_temp_updated.connect(self._on_thermal_temp)
 
     # ════════════════ CALLBACKS ════════════════
     def _on_real_pan(self, v):
@@ -1799,6 +1905,10 @@ class MainWindow(QMainWindow):
         for cam in (self.cam1_widget, self.cam2_widget):
             cam.set_video_filter(mode)
         self._log(f"[VIDEO] Filter: {name}")
+
+    def _on_thermal_temp(self, spot, max_t, min_t):
+        """Update thermal temperature display in status bar."""
+        self.temp_lbl.setText(f"SPOT: {spot:.1f}\u00b0C  MAX: {max_t:.1f}\u00b0C")
 
     # ════════════════ D-PAD ════════════════
     def _on_dpad_pressed(self, d):

@@ -3,6 +3,7 @@
 import socket
 import threading
 import time
+import logging
 from PyQt6.QtCore import QObject, pyqtSignal
 
 
@@ -406,8 +407,9 @@ class PelcoDCommunicator(QObject):
 try:
     from onvif import ONVIFCamera
     HAS_ONVIF = True
-except ImportError:
+except ImportError as _e:
     HAS_ONVIF = False
+    logging.error(f"ONVIF import failed: {_e}")
 
 
 class ONVIFCommunicator(QObject):
@@ -428,9 +430,28 @@ class ONVIFCommunicator(QObject):
         """Connect to ONVIF camera and initialize PTZ service."""
         if not HAS_ONVIF:
             self.error_occurred.emit("onvif-zeep not installed — pip install onvif-zeep")
+            logging.error("[ONVIF] HAS_ONVIF=False — onvif-zeep import failed")
             return
         try:
-            self._cam = ONVIFCamera(ip, port, user, password)
+            import os, sys
+            # Log WSDL dir path for debugging frozen exe
+            wsdl_dir = os.path.join(os.path.dirname(os.path.dirname(
+                __import__('onvif').__file__)), "wsdl")
+            wsdl_exists = os.path.isdir(wsdl_dir)
+            logging.info(f"[ONVIF] wsdl_dir={wsdl_dir} exists={wsdl_exists}")
+            if not wsdl_exists:
+                # In frozen mode, try _MEIPASS-relative path
+                if getattr(sys, 'frozen', False):
+                    alt_wsdl = os.path.join(sys._MEIPASS, 'wsdl')
+                    if os.path.isdir(alt_wsdl):
+                        wsdl_dir = alt_wsdl
+                        wsdl_exists = True
+                        logging.info(f"[ONVIF] Using alt wsdl_dir={wsdl_dir}")
+                if not wsdl_exists:
+                    logging.error(f"[ONVIF] WSDL directory not found: {wsdl_dir}")
+                    self.error_occurred.emit(f"ONVIF WSDL dir missing: {wsdl_dir}")
+                    return
+            self._cam = ONVIFCamera(ip, port, user, password, wsdl_dir=wsdl_dir)
             # Get media service to find profile token
             media = self._cam.create_media_service()
             profiles = media.GetProfiles()

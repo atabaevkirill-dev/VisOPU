@@ -10,14 +10,17 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider,
 from PyQt6.QtCore import (Qt, QTimer, QPointF, QRectF, pyqtSignal,
                            QPropertyAnimation, QEasingCurve, QUrl)
 from PyQt6.QtGui import (QPainter, QColor, QPen, QBrush, QFontMetrics,
-                          QRadialGradient, QPolygonF, QFont, QPainterPath,
-                          QImage, QPixmap)
+                          QRadialGradient, QLinearGradient, QPolygonF, QFont,
+                          QPainterPath, QImage, QPixmap)
 
 try:
     from PyQt6.QtWebEngineWidgets import QWebEngineView
     HAS_WEBENGINE = True
 except ImportError:
     HAS_WEBENGINE = False
+
+import logging
+_logger = logging.getLogger(__name__)
 
 from app.offline_map import MBTilesServer
 
@@ -545,6 +548,9 @@ class CameraWidget(QWidget):
     video_detect_toggled = pyqtSignal(bool)
     video_track_toggled = pyqtSignal(bool)
     video_filter_changed = pyqtSignal(str)
+    # Thermal signals
+    thermal_palette_changed = pyqtSignal(str)
+    thermal_temp_updated = pyqtSignal(float, float, float)  # spot, max, min °C
 
     # D-Pad overlay constants
     _DPAD_R = 50           # D-Pad radius in pixels
@@ -557,6 +563,24 @@ class CameraWidget(QWidget):
     # Video filter modes
     FILTER_NORMAL = 0; FILTER_NVG = 1; FILTER_EDGE = 2; FILTER_BW = 3
     _FILTER_NAMES = ('NORMAL', 'NVG', 'EDGE', 'BW')
+    # Thermal palettes (industry-standard: FLIR / InfiRay / Seek convention)
+    THERMAL_WHITEHOT = 0
+    THERMAL_BLACKHOT = 1
+    THERMAL_IRON     = 2
+    THERMAL_RAINBOW  = 3
+    THERMAL_ARCTIC   = 4
+    THERMAL_LAVA     = 5
+    THERMAL_HOT      = 6
+    _THERMAL_PALETTE_NAMES = ('WHITEHOT', 'BLACKHOT', 'IRON', 'RAINBOW',
+                              'ARCTIC', 'LAVA', 'HOT')
+    # OpenCV colormap indices (JET used as base for IRON/RAINBOW variants)
+    _CV_COLORMAPS = {
+        2: 2,   # IRON    → cv2.COLORMAP_JET
+        3: 2,   # RAINBOW → cv2.COLORMAP_JET
+        4: 0,   # ARCTIC  → cv2.COLORMAP_AUTUMN (cool tones)
+        5: 11,  # LAVA    → cv2.COLORMAP_INFERNO
+        6: 4,   # HOT     → cv2.COLORMAP_HOT
+    }
 
     def __init__(self, name="CAM"):
         super().__init__()
@@ -594,6 +618,31 @@ class CameraWidget(QWidget):
         self._obtn_hover = None   # 'LASER', 'DETECT', 'TRACK', 'FILTER' or None
         # Video filter mode
         self._video_filter = self.FILTER_NORMAL
+        # Thermal camera state
+        self._thermal_palette = self.THERMAL_WHITEHOT
+        self._thermal_show_temp = True   # spot temp + max/min HUD
+        self._thermal_temp_min = -20.0   # °C (configurable range)
+        self._thermal_temp_max = 150.0   # °C
+        self._thermal_spot_temp = None   # float °C at crosshair (smoothed)
+        self._thermal_max_temp = None    # float °C hottest pixel (smoothed)
+        self._thermal_min_temp = None    # float °C coldest pixel (smoothed)
+        self._thermal_max_pos = None     # (x, y) pixel coords of max (smoothed)
+        self._thermal_min_pos = None     # (x, y) pixel coords of min (smoothed)
+        self._thermal_frame_shape = None # (h, w) for coord mapping
+        self._thermal_lut = None         # cached 256x3 uint8 LUT for palette
+        # ── Temporal smoothing (EMA — FLIR/InfiRay best practice) ──
+        self._th_ema_alpha = 0.15       # EMA coefficient (lower = smoother)
+        self._th_spot_roi = 7           # spot averaging kernel (7×7)
+        self._th_emit_interval = 0.25   # emit signal every 250 ms (4 Hz)
+        self._th_last_emit = 0.0        # timestamp of last signal emit
+        self._th_max_hold = 2.0         # hold MAX value for 2 seconds
+        self._th_min_hold = 2.0         # hold MIN value for 2 seconds
+        self._th_max_hold_val = None    # held MAX temperature
+        self._th_max_hold_pos = None    # held MAX position
+        self._th_max_hold_time = 0.0    # last MAX update time
+        self._th_min_hold_val = None    # held MIN temperature
+        self._th_min_hold_pos = None    # held MIN position
+        self._th_min_hold_time = 0.0    # last MIN update time
         self.setMinimumSize(200, 150)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setStyleSheet("background:#1c1c1e;")
@@ -611,6 +660,7 @@ class CameraWidget(QWidget):
         if not HAS_CV2:
             return False
         self.is_thermal = is_thermal
+        _logger.info(f"[CAM] connect_stream is_thermal={is_thermal} name={self.name}")
         self.disconnect_stream()
         try:
             self.cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
@@ -646,6 +696,7 @@ class CameraWidget(QWidget):
         self.update()
 
     def _read_loop(self):
+        thermal_logged = False
         while self._running and self.cap and self.cap.isOpened():
             ret, frame = self.cap.read()
             if ret:
@@ -673,6 +724,73 @@ class CameraWidget(QWidget):
                             pass
                 # Always update video frame (never blocked by detection)
                 filtered = self._apply_video_filter(frame)
+                # Apply thermal palette if this is a thermal camera
+                if self.is_thermal:
+                    if not thermal_logged:
+                        _logger.info(f"[THERMAL] Processing thermal frames, palette={self._THERMAL_PALETTE_NAMES[self._thermal_palette]}")
+                        thermal_logged = True
+                    try:
+                        filtered, raw_spot, raw_max, raw_min, max_xy, min_xy = \
+                            self._apply_thermal_palette(filtered)
+                        if raw_spot is not None:
+                            # ── Convert pixel → temperature ──
+                            t_min = self._thermal_temp_min
+                            t_max = self._thermal_temp_max
+                            t_range = t_max - t_min
+                            spot_raw = t_min + (raw_spot / 255.0) * t_range
+                            max_raw  = t_min + (raw_max  / 255.0) * t_range
+                            min_raw  = t_min + (raw_min  / 255.0) * t_range
+                            # ── EMA smoothing (α=0.15 for stable display) ──
+                            α = self._th_ema_alpha
+                            if self._thermal_spot_temp is None:
+                                # First frame — initialize
+                                self._thermal_spot_temp = spot_raw
+                                self._thermal_max_temp = max_raw
+                                self._thermal_min_temp = min_raw
+                                self._thermal_max_pos = max_xy
+                                self._thermal_min_pos = min_xy
+                            else:
+                                self._thermal_spot_temp = (
+                                    α * spot_raw + (1-α) * self._thermal_spot_temp)
+                                self._thermal_max_temp = (
+                                    α * max_raw + (1-α) * self._thermal_max_temp)
+                                self._thermal_min_temp = (
+                                    α * min_raw + (1-α) * self._thermal_min_temp)
+                                # Position EMA (smooth x,y separately)
+                                omx, omy = self._thermal_max_pos
+                                nmx, nmy = max_xy
+                                self._thermal_max_pos = (
+                                    int(α * nmx + (1-α) * omx),
+                                    int(α * nmy + (1-α) * omy))
+                                omnx, omny = self._thermal_min_pos
+                                nmnx, nmny = min_xy
+                                self._thermal_min_pos = (
+                                    int(α * nmnx + (1-α) * omnx),
+                                    int(α * nmny + (1-α) * omny))
+                            # ── MAX hold (keep peak for 2 s, FLIR convention) ──
+                            now = time.monotonic()
+                            if (self._th_max_hold_val is None or
+                                    max_raw > self._th_max_hold_val or
+                                    now - self._th_max_hold_time > self._th_max_hold):
+                                self._th_max_hold_val = max_raw
+                                self._th_max_hold_pos = max_xy
+                                self._th_max_hold_time = now
+                            if (self._th_min_hold_val is None or
+                                    min_raw < self._th_min_hold_val or
+                                    now - self._th_min_hold_time > self._th_min_hold):
+                                self._th_min_hold_val = min_raw
+                                self._th_min_hold_pos = min_xy
+                                self._th_min_hold_time = now
+                            self._thermal_frame_shape = filtered.shape[:2]
+                            # ── Throttled signal emit (4 Hz) ──
+                            if now - self._th_last_emit >= self._th_emit_interval:
+                                self._th_last_emit = now
+                                self.thermal_temp_updated.emit(
+                                    self._thermal_spot_temp,
+                                    self._thermal_max_temp,
+                                    self._thermal_min_temp)
+                    except Exception as e:
+                        _logger.error(f"[THERMAL] palette error: {e}")
                 rgb = cv2.cvtColor(filtered, cv2.COLOR_BGR2RGB)
                 h, w, ch = rgb.shape
                 qimg = QImage(rgb.data, w, h, w * ch, QImage.Format.Format_RGB888)
@@ -698,6 +816,78 @@ class CameraWidget(QWidget):
                 return
         # Target lost
         self.detection_target.emit(0.0, 0.0, "")
+
+    def _apply_thermal_palette(self, frame):
+        """Apply pseudocolor palette to thermal frame.
+        Returns: (colored_bgr_frame, raw_spot_pixel, raw_max_pixel, raw_min_pixel, max_xy, min_xy)
+        Temperature is NOT computed here — only raw pixel intensities.
+        Smoothing and temp conversion happen in _read_loop.
+        """
+        if not HAS_CV2:
+            return frame, None, None, None, None, None
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            h, w = gray.shape
+
+            # ── Raw pixel sampling (larger ROI for noise rejection) ──
+            roi = self._th_spot_roi  # 7×7 default
+            cy, cx = h // 2, w // 2
+            half = roi // 2
+            spot_roi = gray[max(0, cy-half):cy+half+1,
+                            max(0, cx-half):cx+half+1]
+            spot_val = float(spot_roi.mean())
+
+            # Max/Min on downsampled frame (coarse but stable)
+            step = max(1, min(h, w) // 80)
+            small = gray[::step, ::step]
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(small)
+            max_xy = (max_loc[0] * step, max_loc[1] * step)
+            min_xy = (min_loc[0] * step, min_loc[1] * step)
+
+            # ── Apply palette ──
+            pal = self._thermal_palette
+            if pal == self.THERMAL_WHITEHOT:
+                colored = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            elif pal == self.THERMAL_BLACKHOT:
+                colored = cv2.cvtColor(255 - gray, cv2.COLOR_GRAY2BGR)
+            else:
+                cv_map = self._CV_COLORMAPS.get(pal, 2)
+                colored = cv2.applyColorMap(gray, cv_map)
+                if pal == self.THERMAL_RAINBOW:
+                    colored = cv2.applyColorMap(255 - gray, 2)
+                elif pal == self.THERMAL_ARCTIC:
+                    colored = cv2.applyColorMap(gray, 0)
+                    colored[:, :, 0] = cv2.add(colored[:, :, 0], 60)
+                    colored[:, :, 2] = cv2.subtract(colored[:, :, 2], 30)
+
+            return colored, spot_val, float(max_val), float(min_val), max_xy, min_xy
+        except Exception as e:
+            _logger.error(f"[THERMAL] _apply_thermal_palette failed: {e}")
+            return frame, None, None, None, None, None
+
+    def set_thermal_palette(self, idx):
+        """Set thermal palette by index (0–6). No-op if not thermal."""
+        if not self.is_thermal:
+            return
+        self._thermal_palette = idx % len(self._THERMAL_PALETTE_NAMES)
+        self.thermal_palette_changed.emit(
+            self._THERMAL_PALETTE_NAMES[self._thermal_palette])
+        self.update()
+
+    def cycle_thermal_palette(self):
+        """Cycle to next thermal palette."""
+        nxt = (self._thermal_palette + 1) % len(self._THERMAL_PALETTE_NAMES)
+        self.set_thermal_palette(nxt)
+
+    def toggle_thermal_temp(self):
+        """Toggle temperature HUD visibility."""
+        self._thermal_show_temp = not self._thermal_show_temp
+        self.update()
+
+    def set_thermal_range(self, t_min, t_max):
+        """Set temperature range in °C (e.g. -20, 150)."""
+        self._thermal_temp_min = float(t_min)
+        self._thermal_temp_max = float(t_max)
 
     def _apply_video_filter(self, frame):
         """Apply selected military video filter to frame. Returns filtered BGR frame.
@@ -824,6 +1014,7 @@ class CameraWidget(QWidget):
             self._draw_reticle(p, w, h)
             self._draw_detections(p, w, h)
             self._draw_laser_hud(p, w, h)
+            self._draw_thermal_hud(p, w, h)
             self._draw_video_dpad(p, w, h)
             self._draw_overlay_buttons(p, w, h)
 
@@ -987,6 +1178,173 @@ class CameraWidget(QWidget):
         p.setFont(font_label)
         p.setPen(accent)
         p.drawText(text_x, by + int(36 * scale), label_text)
+
+    def _draw_thermal_hud(self, p, w, h):
+        """FLIR-style thermal HUD: stable spot temp, compact max/min markers, color bar."""
+        if not self.is_thermal or not self._thermal_show_temp:
+            return
+        if self._thermal_spot_temp is None:
+            return
+
+        scale = min(w, h) / 600.0
+        scale = max(0.6, min(scale, 1.8))
+
+        # ── Colors ──
+        white   = QColor(0xF5, 0xF5, 0xF7, 240)
+        red     = QColor(0xFF, 0x45, 0x3A, 220)
+        blue    = QColor(0x0A, 0x84, 0xFF, 220)
+        yellow  = QColor(0xFF, 0xD6, 0x0A, 220)
+        bg      = QColor(0x00, 0x00, 0x00, 140)
+        dim     = QColor(0x8E, 0x8E, 0x93, 180)
+
+        cx, cy = w // 2, h // 2
+        spot = self._thermal_spot_temp
+
+        # ── 1. Spot temperature (below crosshair, clean FLIR style) ──
+        font_spot = QFont("SF Pro Display", max(10, int(16 * scale)), QFont.Weight.Bold)
+        font_unit = QFont("SF Pro Display", max(7, int(9 * scale)))
+        spot_text = f"{spot:.1f}"
+        fm = QFontMetrics(font_spot)
+        tw = fm.horizontalAdvance(spot_text)
+        pill_w = tw + int(20 * scale)
+        pill_h = int(22 * scale)
+        bx = cx - pill_w // 2
+        by = cy + int(24 * scale)
+        # bg pill
+        p.setBrush(bg)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(bx, by - int(16*scale), pill_w, pill_h, 5, 5)
+        p.setFont(font_spot)
+        p.setPen(white)
+        p.drawText(bx + int(6*scale), by, spot_text)
+        fm_u = QFontMetrics(font_unit)
+        uw = fm_u.horizontalAdvance("\u00b0C")
+        p.setFont(font_unit)
+        p.setPen(dim)
+        p.drawText(bx + int(6*scale) + tw + int(2*scale), by, "\u00b0C")
+
+        # ── 2. MAX marker (red dot + compact label) ──
+        if self._thermal_max_pos is not None:
+            mx, my = self._thermal_max_pos
+            mx_w, my_w = self._vid_to_widget(mx, my, w, h)
+            if 0 < mx_w < w and 0 < my_w < h:
+                # Small red dot
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(red)
+                r = int(3 * scale)
+                p.drawEllipse(QPointF(mx_w, my_w), r, r)
+                # Crosshair brackets around max point
+                pen_r = QPen(red, 1)
+                p.setPen(pen_r)
+                bl = int(6 * scale)
+                p.drawLine(mx_w - bl, my_w, mx_w - r - 1, my_w)
+                p.drawLine(mx_w + r + 1, my_w, mx_w + bl, my_w)
+                p.drawLine(mx_w, my_w - bl, mx_w, my_w - r - 1)
+                p.drawLine(mx_w, my_w + r + 1, mx_w, my_w + bl)
+                # Compact label
+                font_sm = QFont("SF Pro Display", max(6, int(8*scale)), QFont.Weight.Bold)
+                p.setFont(font_sm)
+                p.setPen(red)
+                max_t = self._th_max_hold_val if self._th_max_hold_val is not None else self._thermal_max_temp
+                if max_t is not None:
+                    p.drawText(mx_w + bl + 2, my_w + int(3*scale),
+                               f"\u25b2{max_t:.0f}\u00b0")
+
+        # ── 3. MIN marker (blue dot + compact label) ──
+        if self._thermal_min_pos is not None:
+            mnx, mny = self._thermal_min_pos
+            mnx_w, mny_w = self._vid_to_widget(mnx, mny, w, h)
+            if 0 < mnx_w < w and 0 < mny_w < h:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(blue)
+                r = int(3 * scale)
+                p.drawEllipse(QPointF(mnx_w, mny_w), r, r)
+                pen_b = QPen(blue, 1)
+                p.setPen(pen_b)
+                bl = int(6 * scale)
+                p.drawLine(mnx_w - bl, mny_w, mnx_w - r - 1, mny_w)
+                p.drawLine(mnx_w + r + 1, mny_w, mnx_w + bl, mny_w)
+                p.drawLine(mnx_w, mny_w - bl, mnx_w, mny_w - r - 1)
+                p.drawLine(mnx_w, mny_w + r + 1, mnx_w, mny_w + bl)
+                font_sm = QFont("SF Pro Display", max(6, int(8*scale)), QFont.Weight.Bold)
+                p.setFont(font_sm)
+                p.setPen(blue)
+                min_t = self._th_min_hold_val if self._th_min_hold_val is not None else self._thermal_min_temp
+                if min_t is not None:
+                    p.drawText(mnx_w + bl + 2, mny_w + int(3*scale),
+                               f"\u25bc{min_t:.0f}\u00b0")
+
+        # ── 4. Compact color bar (right edge) ──
+        bar_w = int(8 * scale)
+        bar_h = int(h * 0.35)
+        bar_x = w - self._OBTN_X - bar_w - int(4*scale)
+        bar_y = (h - bar_h) // 2
+
+        grad = QLinearGradient(bar_x, bar_y, bar_x, bar_y + bar_h)
+        if self._thermal_palette == self.THERMAL_BLACKHOT:
+            grad.setColorAt(0.0, QColor(0x00, 0x00, 0x00))
+            grad.setColorAt(1.0, QColor(0xFF, 0xFF, 0xFF))
+        elif self._thermal_palette == self.THERMAL_IRON:
+            grad.setColorAt(0.0, QColor(0xFF, 0x44, 0x00))
+            grad.setColorAt(0.5, QColor(0xFF, 0xCC, 0x00))
+            grad.setColorAt(1.0, QColor(0xFF, 0xFF, 0xFF))
+        elif self._thermal_palette == self.THERMAL_RAINBOW:
+            grad.setColorAt(0.0, QColor(0xFF, 0x00, 0x00))
+            grad.setColorAt(0.5, QColor(0x00, 0xFF, 0x00))
+            grad.setColorAt(1.0, QColor(0x00, 0x00, 0xFF))
+        elif self._thermal_palette == self.THERMAL_LAVA:
+            grad.setColorAt(0.0, QColor(0x00, 0x00, 0x00))
+            grad.setColorAt(0.5, QColor(0xCC, 0x33, 0x00))
+            grad.setColorAt(1.0, QColor(0xFF, 0xFF, 0x00))
+        else:
+            grad.setColorAt(0.0, QColor(0x00, 0x00, 0x00))
+            grad.setColorAt(1.0, QColor(0xFF, 0xFF, 0xFF))
+
+        p.setBrush(grad)
+        p.setPen(QPen(QColor(0x48, 0x48, 0x4A, 120), 1))
+        p.drawRoundedRect(bar_x, bar_y, bar_w, bar_h, 2, 2)
+
+        # Only top and bottom temperature labels (clean)
+        font_bar = QFont("SF Pro Display", max(6, int(7*scale)), QFont.Weight.Bold)
+        p.setFont(font_bar)
+        t_top = self._thermal_temp_max
+        t_bot = self._thermal_temp_min
+        p.setPen(QColor(0xF5, 0xF5, 0xF7, 200))
+        p.drawText(bar_x - int(28*scale), bar_y - int(2*scale),
+                   int(26*scale), int(10*scale),
+                   Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                   f"{t_top:.0f}\u00b0")
+        p.drawText(bar_x - int(28*scale), bar_y + bar_h - int(8*scale),
+                   int(26*scale), int(10*scale),
+                   Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                   f"{t_bot:.0f}\u00b0")
+
+        # ── 5. Palette name (small, top-right) ──
+        pal_name = self._THERMAL_PALETTE_NAMES[self._thermal_palette]
+        font_pal = QFont("SF Pro Display", max(6, int(7*scale)), QFont.Weight.Bold)
+        fm_pal = QFontMetrics(font_pal)
+        pal_w = fm_pal.horizontalAdvance(pal_name) + int(10*scale)
+        pal_rect = QRectF(w - pal_w - self._OBTN_X,
+                          self._OBTN_Y + self._OBTN_H + self._OBTN_GAP,
+                          pal_w, int(18*scale))
+        p.setBrush(QColor(0x1C, 0x1C, 0x1E, 140))
+        p.setPen(QPen(QColor(0x48, 0x48, 0x4A, 100), 1))
+        p.drawRoundedRect(pal_rect, 3, 3)
+        p.setFont(font_pal)
+        p.setPen(QColor(0xFF, 0xD6, 0x0A, 200))
+        p.drawText(pal_rect, Qt.AlignmentFlag.AlignCenter, pal_name)
+
+    def _vid_to_widget(self, vx, vy, w, h):
+        """Map video pixel coords (vx,vy) to widget coords."""
+        with self._frame_lock:
+            pix = self._pixmap
+        if not pix or pix.isNull():
+            return -1, -1
+        vid_w, vid_h = pix.width(), pix.height()
+        scaled = min(w / vid_w, h / vid_h)
+        off_x = (w - vid_w * scaled) / 2.0
+        off_y = (h - vid_h * scaled) / 2.0
+        return int(off_x + vx * scaled), int(off_y + vy * scaled)
 
     def _reticle_combat(self, p, cx, cy, w, h):
         col = QColor(0xFF, 0x45, 0x3A, 220)
@@ -1222,6 +1580,14 @@ class CameraWidget(QWidget):
             self.video_track_toggled.emit(self._obtn_track_on)
             self.update()
             return
+        elif btn == 'PAL':
+            self.cycle_thermal_palette()
+            self.update()
+            return
+        elif btn == 'TMP':
+            self.toggle_thermal_temp()
+            self.update()
+            return
         elif btn == 'FILTER':
             # Cycle filter: NORMAL -> NVG -> EDGE -> BW -> NORMAL
             self._video_filter = (self._video_filter + 1) % len(self._FILTER_NAMES)
@@ -1366,11 +1732,18 @@ class CameraWidget(QWidget):
     def _obtn_rects(self):
         """Return list of (label, QRectF, is_on) for overlay buttons."""
         x, y, bw, bh, gap = self._OBTN_X, self._OBTN_Y, self._OBTN_W, self._OBTN_H, self._OBTN_GAP
-        return [
+        rects = [
             ('LSR',    QRectF(x, y, bw, bh),             self._obtn_laser_on),
             ('DET',    QRectF(x, y + bh + gap, bw, bh),  self._obtn_detect_on),
             ('TRACK',  QRectF(x, y + 2*(bh+gap), bw, bh), self._obtn_track_on),
         ]
+        if self.is_thermal:
+            # Thermal buttons below standard buttons
+            n = len(rects)
+            rects.append(('PAL',  QRectF(x, y + n*(bh+gap), bw, bh), False))
+            rects.append(('TMP',  QRectF(x, y + (n+1)*(bh+gap), bw, bh),
+                          self._thermal_show_temp))
+        return rects
 
     def _filter_label_rect(self, w):
         """Return QRectF for filter label in top-right corner."""
@@ -1388,19 +1761,23 @@ class CameraWidget(QWidget):
         return None
 
     def _draw_overlay_buttons(self, p, w, h):
-        """Draw semi-transparent overlay buttons (LSR, DET, TRACK) top-left and filter label top-right."""
-        # Button definitions: (label, rect, is_on, active_color)
+        """Draw semi-transparent overlay buttons top-left and filter label top-right."""
+        # Button definitions: (label, is_on, active_color)
         btn_defs = [
-            ('LSR',   None, self._obtn_laser_on,  QColor(0xFF, 0x45, 0x3A)),
-            ('DET',   None, self._obtn_detect_on, QColor(0x30, 0xD1, 0x58)),
-            ('TRACK', None, self._obtn_track_on,  QColor(0xFF, 0x9F, 0x0A)),
+            ('LSR',   self._obtn_laser_on,  QColor(0xFF, 0x45, 0x3A)),
+            ('DET',   self._obtn_detect_on, QColor(0x30, 0xD1, 0x58)),
+            ('TRACK', self._obtn_track_on,  QColor(0xFF, 0x9F, 0x0A)),
         ]
+        if self.is_thermal:
+            btn_defs.append(('PAL', False, QColor(0xFF, 0xD6, 0x0A)))
+            btn_defs.append(('TMP', self._thermal_show_temp, QColor(0x0A, 0x84, 0xFF)))
+
         font = QFont("SF Pro Display", 8, QFont.Weight.Bold)
         p.setFont(font)
         fm = QFontMetrics(font)
 
         x, y, bw, bh, gap = self._OBTN_X, self._OBTN_Y, self._OBTN_W, self._OBTN_H, self._OBTN_GAP
-        for i, (label, _, is_on, accent) in enumerate(btn_defs):
+        for i, (label, is_on, accent) in enumerate(btn_defs):
             rect = QRectF(x, y + i * (bh + gap), bw, bh)
             hovered = (self._obtn_hover == label)
 
@@ -1484,6 +1861,17 @@ class YandexMapWidget(QWidget):
             srv = self._ensure_server()
             self._web = QWebEngineView(self)
             self._web.setStyleSheet("background:#1c1c1e;")
+
+            # Explicitly enable JavaScript + scroll events (may default to off in exe)
+            settings = self._web.settings()
+            settings.setAttribute(
+                settings.WebAttribute.JavascriptEnabled, True)
+            settings.setAttribute(
+                settings.WebAttribute.LocalStorageEnabled, True)
+            # Ensure scroll wheel / touch events reach the web content
+            settings.setAttribute(
+                settings.WebAttribute.ScrollAnimatorEnabled, True)
+
             self._web.loadFinished.connect(self._on_page_loaded)
             self._web.setUrl(QUrl(f"http://127.0.0.1:{srv.port}/"))
             layout.addWidget(self._web, 1)
