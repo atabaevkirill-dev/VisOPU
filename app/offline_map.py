@@ -25,56 +25,9 @@ from urllib.error import URLError
 
 log = logging.getLogger(__name__)
 
-# ── Leaflet assets (served from local server so map works fully offline) ──
-
-_LEAFLET_VERSION = "1.9.4"
-_UNPKG_CSS = f"https://unpkg.com/leaflet@{_LEAFLET_VERSION}/dist/leaflet.css"
-_UNPKG_JS = f"https://unpkg.com/leaflet@{_LEAFLET_VERSION}/dist/leaflet.js"
-
-# Cached at module level after first fetch
-_cached_css: str | None = None
-_cached_js: str | None = None
-
-
-def _fetch_leaflet_assets() -> tuple[str, str]:
-    """Download and cache Leaflet CSS/JS (one-time, on first server start)."""
-    global _cached_css, _cached_js
-    if _cached_css and _cached_js:
-        return _cached_css, _cached_js
-
-    # Try local files first (user can place leaflet.css / leaflet.js next to mbtiles)
-    here = os.path.dirname(os.path.abspath(__file__))
-    css_path = os.path.join(here, "leaflet.css")
-    js_path = os.path.join(here, "leaflet.js")
-
-    if os.path.isfile(css_path):
-        with open(css_path, "r", encoding="utf-8") as f:
-            _cached_css = f.read()
-    else:
-        try:
-            _cached_css = urlopen(_UNPKG_CSS, timeout=10).read().decode("utf-8")
-        except Exception:
-            _cached_css = "/* Leaflet CSS unavailable */"
-
-    if os.path.isfile(js_path):
-        with open(js_path, "r", encoding="utf-8") as f:
-            _cached_js = f.read()
-    else:
-        try:
-            _cached_js = urlopen(_UNPKG_JS, timeout=10).read().decode("utf-8")
-        except Exception:
-            _cached_js = "/* Leaflet JS unavailable */"
-
-    return _cached_css, _cached_js
-
 
 def _build_map_html(tile_url: str, has_mbtiles: bool) -> str:
-    """Build the full Leaflet map HTML with the correct tile URL."""
-    css, js = _fetch_leaflet_assets()
-
-    # Escape backticks / dollar signs for embedding in template
-    # (Leaflet JS is safe to embed as-is since it doesn't use backtick templates
-    # at the top level in a conflicting way, but we use a script tag)
+    """Build the MapLibre GL JS map with 3D buildings, compass rotation, and interactive beam."""
 
     return f"""\
 <!DOCTYPE html>
@@ -82,70 +35,128 @@ def _build_map_html(tile_url: str, has_mbtiles: bool) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-{css}
-</style>
-<script>
-{js}
-</script>
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
-html,body{{width:100%;height:100%;overflow:hidden;background:#1c1c1e}}
+html,body{{width:100%;height:100%;overflow:hidden;background:#0a0a0a}}
 #map{{width:100%;height:100%}}
-.leaflet-control-zoom a{{background:#2c2c2e!important;color:#f5f5f7!important;border:1px solid #48484a!important}}
-.leaflet-control-zoom a:hover{{background:#3a3a3c!important}}
-.leaflet-control-attribution{{display:none!important}}
-.leaflet-popup-content-wrapper{{background:rgba(28,28,30,0.94);color:#f5f5f7;border:1px solid rgba(72,72,74,0.6);border-radius:6px;font:600 11px 'SF Pro Display',sans-serif}}
-.leaflet-popup-tip{{background:rgba(28,28,30,0.94)}}
+.maplibregl-ctrl-group{{background:rgba(20,20,25,0.85)!important;border:1px solid rgba(80,80,85,0.5)!important;border-radius:8px!important;backdrop-filter:blur(10px)}}
+.maplibregl-ctrl-group button{{width:29px!important;height:29px!important}}
+.maplibregl-ctrl-group button+button{{border-top:1px solid rgba(80,80,85,0.3)!important}}
+.maplibregl-ctrl-attrib{{display:none!important}}
+.maplibregl-popup-content{{background:rgba(20,20,25,0.95)!important;color:#f5f5f7!important;border:1px solid rgba(10,132,255,0.4)!important;border-radius:8px!important;font:600 11px 'SF Pro Display',sans-serif!important;padding:8px 12px!important;backdrop-filter:blur(10px)}}
+.maplibregl-popup-tip{{border-top-color:rgba(20,20,25,0.95)!important}}
+
+/* Compass */
+#compass{{position:absolute;top:14px;left:14px;width:56px;height:56px;z-index:10;cursor:pointer;pointer-events:auto}}
+#compass svg{{width:100%;height:100%;filter:drop-shadow(0 2px 8px rgba(0,0,0,0.6))}}
+#compass .ring{{fill:none;stroke:rgba(60,60,65,0.7);stroke-width:1.5}}
+#compass .n{{fill:#ff453a}}
+#compass .s{{fill:#636366}}
+#compass .cap{{fill:#2c2c2e;stroke:#48484a;stroke-width:1}}
+#compass .lbl{{fill:#98989d;font:700 9px 'SF Pro Display',sans-serif;text-anchor:middle}}
+
+/* HUD */
 #hud{{position:absolute;bottom:14px;left:50%;transform:translateX(-50%);
-  background:rgba(28,28,30,0.92);border:1px solid rgba(10,132,255,0.4);
-  border-radius:8px;padding:8px 18px;color:#f5f5f7;font:600 13px 'SF Pro Display',sans-serif;
-  display:none;pointer-events:none;white-space:nowrap;z-index:1000}}
-#hud.show{{display:flex;align-items:center;gap:10px}}
-#hud .dist{{color:#0a84ff;font-size:16px}}
+  background:rgba(14,14,16,0.94);border:1px solid rgba(10,132,255,0.4);
+  border-radius:10px;padding:8px 20px;color:#f5f5f7;font:600 13px 'SF Pro Display',sans-serif;
+  display:none;align-items:center;gap:12px;z-index:10;pointer-events:none;
+  backdrop-filter:blur(12px);box-shadow:0 4px 24px rgba(0,0,0,0.5)}}
+#hud.show{{display:flex}}
+#hud .dist{{color:#0a84ff;font-size:16px;font-weight:700}}
 #hud .brg{{color:#30d158;font-size:13px}}
 #hud .unit{{color:#636366;font-size:11px}}
 #hud .hint{{color:#98989d;font-size:10px}}
-#clearBtn{{position:absolute;top:10px;right:10px;z-index:1000;
-  background:rgba(28,28,30,0.9);border:1px solid rgba(72,72,74,0.6);
-  border-radius:6px;padding:6px 14px;color:#98989d;font:600 10px 'SF Pro Display',sans-serif;
-  cursor:pointer;letter-spacing:1px;display:none}}
-#clearBtn:hover{{background:rgba(45,45,45,0.95);color:#f5f5f7;border-color:#0a84ff}}
-#clearBtn.show{{display:block}}
-#beamInfo{{position:absolute;bottom:14px;left:14px;z-index:1000;
-  background:rgba(28,28,30,0.88);border:1px solid rgba(255,159,10,0.4);
-  border-radius:6px;padding:6px 12px;color:#ff9f0a;font:600 11px 'SF Pro Display',sans-serif;
-  pointer-events:none;display:none}}
+
+/* Beam info */
+#beamInfo{{position:absolute;bottom:14px;left:14px;z-index:10;
+  background:rgba(14,14,16,0.92);border:1px solid rgba(255,159,10,0.5);
+  border-radius:8px;padding:6px 14px;color:#ff9f0a;font:600 12px 'SF Pro Display',sans-serif;
+  pointer-events:none;display:none;backdrop-filter:blur(10px);
+  box-shadow:0 2px 12px rgba(255,159,10,0.2)}}
 #beamInfo.show{{display:block}}
+#beamInfo .val{{font-size:16px;font-weight:700}}
+#beamInfo .sep{{color:#636366;margin:0 6px}}
+#beamInfo .len{{color:#bf5af2}}
+
+/* Clear button */
+#clearBtn{{position:absolute;top:14px;right:14px;z-index:10;
+  background:rgba(14,14,16,0.92);border:1px solid rgba(80,80,85,0.5);
+  border-radius:8px;padding:6px 16px;color:#98989d;font:600 10px 'SF Pro Display',sans-serif;
+  cursor:pointer;letter-spacing:1px;display:none;backdrop-filter:blur(10px)}}
+#clearBtn:hover{{background:rgba(40,40,45,0.95);color:#f5f5f7;border-color:#0a84ff}}
+#clearBtn.show{{display:block}}
+
+/* Mode indicator */
+#modeInd{{position:absolute;top:14px;left:50%;transform:translateX(-50%);z-index:10;
+  background:rgba(10,132,255,0.2);border:1px solid rgba(10,132,255,0.5);
+  border-radius:6px;padding:4px 12px;color:#0a84ff;font:600 10px 'SF Pro Display',sans-serif;
+  letter-spacing:1px;display:none;pointer-events:none;backdrop-filter:blur(8px)}}
+#modeInd.show{{display:block}}
+
+/* Offline fallback */
 #offline{{position:absolute;inset:0;display:none;flex-direction:column;
   align-items:center;justify-content:center;color:#636366;
-  font:600 14px 'SF Pro Display',sans-serif;background:#1c1c1e;z-index:2000}}
+  font:600 14px 'SF Pro Display',sans-serif;background:#0a0a0a;z-index:20}}
 #offline .icon{{font-size:48px;margin-bottom:12px;opacity:0.4}}
 #offline .sub{{font-size:11px;color:#48484a;margin-top:6px}}
+
+/* Beam drag cursor */
+body.beam-drag{{cursor:grabbing!important}}
+body.beam-hover{{cursor:grab!important}}
 </style>
 </head>
 <body>
 <div id="map"></div>
-<div id="hud"><span class="dist" id="distVal">0</span><span class="unit">m</span><span class="brg" id="brgVal"></span><span class="hint">LClick: measure | RClick: set device | DblClick: finish</span></div>
+
+<!-- Compass rose -->
+<div id="compass" title="Reset rotation">
+<svg viewBox="0 0 56 56">
+  <circle class="ring" cx="28" cy="28" r="26"/>
+  <g id="compassNeedle">
+    <polygon class="n" points="28,4 32,28 24,28"/>
+    <polygon class="s" points="28,52 32,28 24,28"/>
+  </g>
+  <circle class="cap" cx="28" cy="28" r="5"/>
+  <text class="lbl" x="28" y="16">N</text>
+</svg>
+</div>
+
+<div id="hud">
+  <span class="dist" id="distVal">0</span><span class="unit">m</span>
+  <span class="brg" id="brgVal"></span>
+  <span class="hint">LClick: measure | Shift+Drag: beam | RClick: device | DblClick: reset</span>
+</div>
 <button id="clearBtn" onclick="clearAll()">CLEAR</button>
-<div id="beamInfo">BEAM <span id="beamAngle">0</span>&deg;</div>
+<div id="beamInfo">
+  BEAM <span class="val" id="beamAngle">0</span>&deg;
+  <span class="sep">|</span>
+  <span class="len" id="beamLen">3000</span>m
+</div>
+<div id="modeInd">BEAM CONTROL</div>
 <div id="offline"><div class="icon">&#x1F5FA;</div>Map offline<div class="sub">No tiles available</div></div>
+
 <script>
 var map, devicePos=[55.751574,37.573856];
-var beamOffset=0, beamLength=3000, currentPan=0;
-var markers=[], line=null, bearingLines=[], points=[], totalDist=0;
-var devMarker=null, beamLine=null, beamMarker=null, beamCone=null;
-var hud=document.getElementById('hud'), distVal=document.getElementById('distVal');
-var brgVal=document.getElementById('brgVal');
-var clearBtn=document.getElementById('clearBtn');
-var beamInfo=document.getElementById('beamInfo'), beamAngleEl=document.getElementById('beamAngle');
-var offlineDiv=document.getElementById('offline');
-var HAS_LOCAL_TILES = {str(has_mbtiles).lower()};
+var beamOffset=0, beamLength=3000, currentPan=0, mapBearing=0;
+var markers=[], points=[], totalDist=0, line=null, bearingLines=[];
+var beamDrag=false, beamDragStart=null, beamOffsetStart=0;
+var HAS_LOCAL_TILES={str(has_mbtiles).lower()};
 
+// DOM
+var hud=document.getElementById('hud'), distVal=document.getElementById('distVal');
+var brgVal=document.getElementById('brgVal'), clearBtn=document.getElementById('clearBtn');
+var beamInfo=document.getElementById('beamInfo'), beamAngleEl=document.getElementById('beamAngle');
+var beamLenEl=document.getElementById('beamLen'), modeInd=document.getElementById('modeInd');
+var compassEl=document.getElementById('compass'), compassNeedle=document.getElementById('compassNeedle');
+var offlineDiv=document.getElementById('offline');
+
+// ── Geometry helpers ──
 function haversine(a,b){{
-  var R=6371000, dLat=(b[0]-a[0])*Math.PI/180, dLon=(b[1]-a[1])*Math.PI/180;
-  var la=a[0]*Math.PI/180, lb=b[0]*Math.PI/180;
-  var x=Math.sin(dLat/2)*Math.sin(dLat/2)+Math.cos(la)*Math.cos(lb)*Math.sin(dLon/2)*Math.sin(dLon/2);
+  var R=6371000,dLat=(b[0]-a[0])*Math.PI/180,dLon=(b[1]-a[1])*Math.PI/180;
+  var la=a[0]*Math.PI/180,lb=b[0]*Math.PI/180;
+  var x=Math.sin(dLat/2)**2+Math.cos(la)*Math.cos(lb)*Math.sin(dLon/2)**2;
   return R*2*Math.atan2(Math.sqrt(x),Math.sqrt(1-x));
 }}
 function bearing(a,b){{
@@ -157,19 +168,98 @@ function destPoint(lat,lon,brg,d){{
   var R=6371000,dR=d/R,la=lat*Math.PI/180,lo=lon*Math.PI/180,b=brg*Math.PI/180;
   var la2=Math.asin(Math.sin(la)*Math.cos(dR)+Math.cos(la)*Math.sin(dR)*Math.cos(b));
   var lo2=lo+Math.atan2(Math.sin(b)*Math.sin(dR)*Math.cos(la),Math.cos(dR)-Math.sin(la)*Math.sin(la2));
-  return [la2*180/Math.PI,lo2*180/Math.PI];
+  return [lo2*180/Math.PI,la2*180/Math.PI]; // [lng,lat] for GeoJSON
 }}
 function fmtDist(m){{return m>=1000?(m/1000).toFixed(2)+' km':m.toFixed(0)+' m'}}
 
-// Device marker
-function updateDeviceMarker(){{
-  if(!devMarker){{
-    devMarker=L.circleMarker(devicePos,{{radius:7,fillColor:'#ff453a',fillOpacity:1,
-      color:'#ff453a',weight:2}}).addTo(map);
-    devMarker.bindTooltip('Device',{{permanent:false,direction:'top'}});
-  }} else devMarker.setLatLng(devicePos);
+// ── Compass rotation ──
+function updateCompass(){{
+  mapBearing=map.getBearing();
+  compassNeedle.setAttribute('transform','rotate('+(-mapBearing)+',28,28)');
+}}
+compassEl.addEventListener('click',function(){{
+  map.rotateTo(0,{{duration:600,easing:function(t){{return t<0.5?2*t*t:(4-2*t)*t-1}}}});
+}});
+
+// ── Beam source (GeoJSON) ──
+var beamSource={{
+  type:'FeatureCollection',
+  features:[
+    {{type:'Feature',id:'beamRay',properties:{{type:'ray'}},geometry:{{type:'LineString',coordinates:[[0,0],[0,0]]}}}},
+    {{type:'Feature',id:'beamCone',properties:{{type:'cone'}},geometry:{{type:'Polygon',coordinates:[[[0,0],[0,0],[0,0],[0,0],[0,0]]]}}}},
+    {{type:'Feature',id:'beamEnd',properties:{{type:'end'}},geometry:{{type:'Point',coordinates:[0,0]}}}},
+    {{type:'Feature',id:'devicePt',properties:{{type:'device'}},geometry:{{type:'Point',coordinates:[0,0]}}}}
+  ]
+}};
+
+function updateBeamSources(panDeg){{
+  currentPan=panDeg;
+  var bng=((panDeg+beamOffset)%360+360)%360;
+  var ep=destPoint(devicePos[0],devicePos[1],bng,beamLength);
+  var halfSpread=10;
+  var b1=((bng-halfSpread)%360+360)%360;
+  var b2=((bng+halfSpread)%360+360)%360;
+  var ep1=destPoint(devicePos[0],devicePos[1],b1,beamLength*0.75);
+  var ep2=destPoint(devicePos[0],devicePos[1],b2,beamLength*0.75);
+  var dev=[devicePos[1],devicePos[0]]; // [lng,lat]
+  beamSource.features[0].geometry.coordinates=[dev,ep];
+  beamSource.features[1].geometry.coordinates=[[dev,ep1,ep,ep2,dev]];
+  beamSource.features[2].geometry.coordinates=ep;
+  beamSource.features[3].geometry.coordinates=dev;
+  if(map&&map.getSource('beam')){{
+    map.getSource('beam').setData(beamSource);
+  }}
+  beamAngleEl.textContent=bng.toFixed(0);
+  beamLenEl.textContent=beamLength.toFixed(0);
+  beamInfo.classList.add('show');
 }}
 
+// ── Python bridge ──
+function pySetPan(deg){{updateBeamSources(parseFloat(deg))}}
+function pySetDevicePos(lat,lng){{
+  devicePos=[parseFloat(lat),parseFloat(lng)];
+  if(map) map.flyTo({{center:[devicePos[1],devicePos[0]],zoom:map.getZoom(),duration:800}});
+  updateBeamSources(currentPan);
+}}
+function pySetBeamOffset(deg){{beamOffset=parseFloat(deg);updateBeamSources(currentPan)}}
+function pySetBeamLength(m){{beamLength=parseFloat(m);updateBeamSources(currentPan)}}
+function pyApplyConfig(lat,lng,offset,length,pan){{
+  devicePos=[parseFloat(lat),parseFloat(lng)];
+  beamOffset=parseFloat(offset);beamLength=parseFloat(length);
+  if(map) map.setCenter([devicePos[1],devicePos[0]]);
+  updateBeamSources(parseFloat(pan));
+}}
+
+// ── Measurement ──
+function addMeasurePoint(lnglat){{
+  var pt=[lnglat.lat,lnglat.lng];
+  if(points.length>0){{totalDist+=haversine(points[points.length-1],pt)}}
+  points.push(pt);
+  // Marker
+  var el=document.createElement('div');
+  el.style.cssText='width:12px;height:12px;border-radius:50%;background:#0a84ff;border:2px solid #fff;box-shadow:0 0 8px rgba(10,132,255,0.6)';
+  var m=new maplibregl.Marker({{element:el}}).setLngLat(lnglat).addTo(map);
+  markers.push(m);
+  // Line
+  if(line) line.remove();
+  if(points.length>=2){{
+    var coords=points.map(function(p){{return [p[1],p[0]]}});
+    line={{remove:function(){{}}}};
+    var src={{type:'Feature',geometry:{{type:'LineString',coordinates:coords}}}};
+    if(map.getSource('measure'))map.getSource('measure').setData(src);
+  }}
+  // Bearing line
+  var brg=bearing(devicePos,pt).toFixed(0);
+  var distDev=haversine(devicePos,pt);
+  updateHud();
+}}
+function clearAll(){{
+  markers.forEach(function(m){{m.remove()}});
+  markers=[];points=[];totalDist=0;
+  if(line){{try{{map.removeLayer('measureLine');map.removeSource('measure')}}catch(e){{}}}}
+  line=null;
+  hud.classList.remove('show');clearBtn.classList.remove('show');
+}}
 function updateHud(){{
   if(points.length===0){{hud.classList.remove('show');clearBtn.classList.remove('show');return}}
   var last=points[points.length-1];
@@ -180,147 +270,258 @@ function updateHud(){{
   hud.classList.add('show');clearBtn.classList.add('show');
 }}
 
-function clearAll(){{
-  markers.forEach(function(m){{map.removeLayer(m)}});
-  bearingLines.forEach(function(l){{map.removeLayer(l)}});
-  if(line) map.removeLayer(line);
-  markers=[];bearingLines=[];points=[];line=null;totalDist=0;
-  updateHud();
+// ── Beam drag control ──
+function getBeamEndLngLat(){{
+  var bng=((currentPan+beamOffset)%360+360)%360;
+  return destPoint(devicePos[0],devicePos[1],bng,beamLength);
+}}
+function isNearBeamEnd(lnglat){{
+  var ep=getBeamEndLngLat();
+  return haversine([lnglat.lat,lnglat.lng],[ep[1],ep[0]])<beamLength*0.15;
+}}
+function isNearBeamLine(lnglat){{
+  var bng=((currentPan+beamOffset)%360+360)%360;
+  var brgToMouse=bearing(devicePos,[lnglat.lat,lnglat.lng]);
+  var distToMouse=haversine(devicePos,[lnglat.lat,lnglat.lng]);
+  var angleDiff=Math.abs(((brgToMouse-bng+180)%360)-180);
+  return distToMouse<=beamLength*1.1 && angleDiff<15;
 }}
 
-// Beam visualization
-function updateBeam(panDeg){{
-  currentPan=panDeg;
-  var bng=((panDeg+beamOffset)%360+360)%360;
-  var endPt=destPoint(devicePos[0],devicePos[1],bng,beamLength);
+// Shift+drag to rotate beam
+map.addEventListener&&(document.addEventListener('keydown',function(e){{if(e.key==='Shift')window._shiftDown=true}}));
+document.addEventListener('keyup',function(e){{if(e.key==='Shift')window._shiftDown=false}});
 
-  updateDeviceMarker();
-
-  // Beam ray
-  if(!beamLine){{
-    beamLine=L.polyline([devicePos,endPt],{{color:'#FF9F0A',weight:2,opacity:0.8,
-      dashArray:'8,6'}}).addTo(map);
-  }} else beamLine.setLatLngs([devicePos,endPt]);
-
-  // Beam cone
-  var halfSpread=8;
-  var b1=((bng-halfSpread)%360+360)%360;
-  var b2=((bng+halfSpread)%360+360)%360;
-  var ep1=destPoint(devicePos[0],devicePos[1],b1,beamLength*0.7);
-  var ep2=destPoint(devicePos[0],devicePos[1],b2,beamLength*0.7);
-  if(!beamCone){{
-    beamCone=L.polygon([devicePos,ep1,endPt,ep2],{{
-      fillColor:'#FF9F0A',fillOpacity:0.12,stroke:false}}).addTo(map);
-  }} else beamCone.setLatLngs([devicePos,ep1,endPt,ep2]);
-
-  // Beam end dot
-  if(!beamMarker){{
-    beamMarker=L.circleMarker(endPt,{{radius:5,fillColor:'#FF9F0A',fillOpacity:1,
-      color:'#FF9F0A',weight:1}}).addTo(map);
-  }} else beamMarker.setLatLng(endPt);
-
-  beamAngleEl.textContent=bng.toFixed(0);
-  beamInfo.classList.add('show');
-}}
-
-// Python -> JS bridge
-function pySetPan(deg){{updateBeam(parseFloat(deg))}}
-function pySetDevicePos(lat,lng){{
-  devicePos=[parseFloat(lat),parseFloat(lng)];
-  if(map) map.setView(devicePos, map.getZoom(), {{animate:false}});
-  updateBeam(currentPan);
-  updateBearingLines();
-}}
-function pySetBeamOffset(deg){{beamOffset=parseFloat(deg);updateBeam(currentPan)}}
-function pySetBeamLength(m){{beamLength=parseFloat(m);updateBeam(currentPan)}}
-
-// Saved config apply on load
-function pyApplyConfig(lat,lng,offset,length,pan){{
-  devicePos=[parseFloat(lat),parseFloat(lng)];
-  beamOffset=parseFloat(offset);
-  beamLength=parseFloat(length);
-  if(map) map.setView(devicePos, map.getZoom(), {{animate:false}});
-  updateBeam(parseFloat(pan));
-}}
-
-// Bearing lines: draw from device to each measured point
-function updateBearingLines(){{
-  bearingLines.forEach(function(l){{map.removeLayer(l)}});
-  bearingLines=[];
-  points.forEach(function(pt,i){{
-    var brg=bearing(devicePos,pt).toFixed(0);
-    var dist=haversine(devicePos,pt);
-    var bl=L.polyline([devicePos,pt],{{
-      color:'#30d158',weight:1.5,opacity:0.6,dashArray:'6,4'
-    }}).addTo(map);
-    bl.bindPopup('<b>P'+(i+1)+'</b><br>'+brg+'\u00B0 | '+fmtDist(dist));
-    bearingLines.push(bl);
-  }});
-}}
-
-// Init map
+// ── Init map ──
 try {{
-  map=L.map('map',{{center:devicePos,zoom:14,zoomControl:true,
-    attributionControl:false}});
+  map=new maplibregl.Map({{
+    container:'map',
+    style:{{
+      version:8,
+      name:'VisOPU Dark',
+      sources:{{
+        'raster-tiles':{{
+          type:'raster',
+          tiles:['{tile_url}'],
+          tileSize:256,
+          attribution:''
+        }}
+      }},
+      layers:[
+        {{id:'osm-tiles',type:'raster',source:'raster-tiles',paint:{{
+          'raster-brightness-max':0.35,
+          'raster-saturation':-0.6,
+          'raster-contrast':0.1
+        }}}}
+      ],
+      glyphs:'https://demotiles.maplibre.org/font/{{fontstack}}/{{range}}.pbf'
+    }},
+    center:[devicePos[1],devicePos[0]],
+    zoom:14,
+    pitch:0,
+    bearing:0,
+    maxPitch:60,
+    attributionControl:false
+  }});
 
-  // Primary: local tiles from MBTiles server
-  var localLayer=L.tileLayer('{tile_url}',{{
-    maxZoom:19, errorTileUrl:'', tms:false
-  }}).addTo(map);
+  // Controls
+  map.addControl(new maplibregl.NavigationControl({{showCompass:false}}), 'top-right');
+  map.addControl(new maplibregl.ScaleControl({{maxWidth:120,unit:'metric'}}), 'bottom-right');
 
-  var tilesLoaded=false;
-  var localFailed=false;
+  // Rotation/bearing update
+  map.on('rotate',updateCompass);
+  map.on('pitch',function(){{}});  // pitch allowed
 
-  localLayer.on('tileerror',function(){{
-    if(!tilesLoaded){{
-      // If local tiles failed and we don't have mbtiles, show offline
-      if(!HAS_LOCAL_TILES) offlineDiv.style.display='flex';
+  map.on('load',function(){{
+    // ── 3D Buildings (from OSM via Overpass, loaded as source) ──
+    // We'll add building extrusion from a static GeoJSON layer
+    // For now, add a procedural "building" effect using the map style
+    // Add building footprint source (we'll generate some around device)
+    map.addSource('beam',{{type:'geojson',data:beamSource}});
+    map.addSource('buildings',{{type:'geojson',data:{{type:'FeatureCollection',features:[]}}}});
+
+    // ── 3D Buildings layer ──
+    map.addLayer({{
+      id:'buildings-3d',
+      type:'fill-extrusion',
+      source:'buildings',
+      paint:{{
+        'fill-extrusion-color':['interpolate',['linear'],['get','height'],0,'#1a1a2e',50,'#16213e',100,'#0f3460'],
+        'fill-extrusion-height':['get','height'],
+        'fill-extrusion-base':0,
+        'fill-extrusion-opacity':0.7
+      }}
+    }});
+
+    // ── Measure line ──
+    map.addSource('measure',{{type:'geojson',data:{{type:'Feature',geometry:{{type:'LineString',coordinates:[]}}}}}});
+    map.addLayer({{id:'measureLine',type:'line',source:'measure',
+      paint:{{'line-color':'#0a84ff','line-width':2.5,'line-dasharray':[2,2]}}}});
+
+    // ── Beam cone (fill) ──
+    map.addLayer({{
+      id:'beamConeLayer',type:'fill',source:'beam',
+      filter:['==',['get','type'],'cone'],
+      paint:{{'fill-color':'#ff9f0a','fill-opacity':0.15}}
+    }});
+
+    // ── Beam ray (line) ──
+    map.addLayer({{
+      id:'beamRayLayer',type:'line',source:'beam',
+      filter:['==',['get','type'],'ray'],
+      paint:{{
+        'line-color':'#ff9f0a',
+        'line-width':2.5,
+        'line-dasharray':[3,2],
+        'line-opacity':0.9
+      }}
+    }});
+
+    // ── Beam end dot ──
+    map.addLayer({{
+      id:'beamEndLayer',type:'circle',source:'beam',
+      filter:['==',['get','type'],'end'],
+      paint:{{
+        'circle-radius':6,
+        'circle-color':'#ff9f0a',
+        'circle-stroke-color':'#fff',
+        'circle-stroke-width':1.5,
+        'circle-opacity':0.9
+      }}
+    }});
+
+    // ── Device point ──
+    map.addLayer({{
+      id:'deviceLayer',type:'circle',source:'beam',
+      filter:['==',['get','type'],'device'],
+      paint:{{
+        'circle-radius':8,
+        'circle-color':'#ff453a',
+        'circle-stroke-color':'#fff',
+        'circle-stroke-width':2,
+        'circle-opacity':1
+      }}
+    }});
+
+    // ── Device label ──
+    map.addLayer({{
+      id:'deviceLabel',type:'symbol',source:'beam',
+      filter:['==',['get','type'],'device'],
+      layout:{{
+        'text-field':'DEVICE',
+        'text-offset':[0,-1.8],
+        'text-size':10,
+        'text-font':['Open Sans Bold']
+      }},
+      paint:{{'text-color':'#ff453a','text-halo-color':'#0a0a0a','text-halo-width':1}}
+    }});
+
+    // ── Load OSM buildings around device ──
+    loadBuildings();
+
+    updateBeamSources(0);
+    updateCompass();
+  }});
+
+  // ── Click: measure or beam drag ──
+  var _dragStart=null,_dragOffsetStart=0,_dragLengthStart=0;
+
+  map.on('mousedown',function(e){{
+    if(e.originalEvent.shiftKey){{
+      // Beam control mode
+      _dragStart={{x:e.point.x,y:e.point.y}};
+      _dragOffsetStart=beamOffset;
+      _dragLengthStart=beamLength;
+      beamDrag=true;
+      map.getCanvas().style.cursor='grabbing';
+      modeInd.classList.add('show');
+      e.preventDefault();
     }}
   }});
-  localLayer.on('tileload',function(){{tilesLoaded=true;offlineDiv.style.display='none'}});
 
-  // LEFT CLICK — measure distance
+  map.on('mousemove',function(e){{
+    if(beamDrag && _dragStart){{
+      var dx=e.point.x-_dragStart.x;
+      var dy=e.point.y-_dragStart.y;
+      // Horizontal drag = rotate beam (1px = 0.5 degrees)
+      beamOffset=_dragOffsetStart+dx*0.5;
+      beamOffset=((beamOffset%360)+360)%360;
+      // Vertical drag = change length (1px = 5 meters)
+      beamLength=Math.max(100,_dragLengthStart-dy*5);
+      updateBeamSources(currentPan);
+    }} else if(!beamDrag){{
+      // Hover effect near beam
+      var near=isNearBeamLine([e.lngLat.lat,e.lngLat.lng]);
+      map.getCanvas().style.cursor=near?'grab':'';
+    }}
+  }});
+
+  map.on('mouseup',function(e){{
+    if(beamDrag){{
+      beamDrag=false;
+      _dragStart=null;
+      map.getCanvas().style.cursor='';
+      modeInd.classList.remove('show');
+      // Emit to Python
+      window.pyBeamChanged&&window.pyBeamChanged(beamOffset,beamLength);
+    }}
+  }});
+
   map.on('click',function(e){{
-    var latlng=[e.latlng.lat,e.latlng.lng];
-    if(points.length>0){{
-      var prev=points[points.length-1];
-      totalDist+=haversine(prev,latlng);
+    if(!e.originalEvent.shiftKey && !beamDrag){{
+      addMeasurePoint(e.lngLat);
     }}
-    points.push(latlng);
-    var pm=L.circleMarker(latlng,{{radius:5,fillColor:'#0a84ff',fillOpacity:1,
-      color:'#0a84ff',weight:1}}).addTo(map);
-    markers.push(pm);
-    if(line) map.removeLayer(line);
-    if(points.length>=2){{
-      line=L.polyline(points,{{color:'#0a84ff',weight:2,opacity:1}}).addTo(map);
-    }}
-    var brg=bearing(devicePos,latlng).toFixed(0);
-    var distDev=haversine(devicePos,latlng);
-    var bl=L.polyline([devicePos,latlng],{{
-      color:'#30d158',weight:1.5,opacity:0.6,dashArray:'6,4'
-    }}).addTo(map);
-    bl.bindPopup('<b>P'+points.length+'</b><br>'+brg+'\u00B0 | '+fmtDist(distDev));
-    bearingLines.push(bl);
-    pm.bindTooltip('P'+points.length+' '+brg+'\u00B0 '+fmtDist(distDev),{{
-      permanent:false,direction:'top',className:'leaflet-popup-content-wrapper'}});
-    updateHud();
   }});
 
-  // RIGHT CLICK — set device position
+  // Right-click: set device position
   map.on('contextmenu',function(e){{
-    L.DomEvent.preventDefault(e);
-    devicePos=[e.latlng.lat,e.latlng.lng];
-    devMarker.setLatLng(devicePos);
-    updateBeam(currentPan);
-    updateBearingLines();
-    updateHud();
+    e.preventDefault();
+    devicePos=[e.lngLat.lat,e.lngLat.lng];
+    updateBeamSources(currentPan);
   }});
 
-  // Dbl-click to finish
-  map.on('dblclick',function(e){{L.DomEvent.stopPropagation(e);updateHud()}});
+  // Double-click: reset view
   map.doubleClickZoom.disable();
+  map.on('dblclick',function(e){{
+    e.preventDefault();
+    map.flyTo({{center:[devicePos[1],devicePos[0]],zoom:14,bearing:0,pitch:0,duration:1000}});
+  }});
 
-  updateBeam(0);
+  // Scroll on beam: change length
+  map.getCanvas().addEventListener('wheel',function(e){{
+    if(e.shiftKey){{
+      e.preventDefault();
+      beamLength=Math.max(100,beamLength-e.deltaY*2);
+      updateBeamSources(currentPan);
+    }}
+  }},{{passive:false}});
+
+  // ── Load buildings from OSM Overpass ──
+  function loadBuildings(){{
+    var lat=devicePos[0],lng=devicePos[1];
+    var delta=0.008; // ~800m
+    var bbox=(lat-delta)+','+(lng-delta)+','+(lat+delta)+','+(lng+delta);
+    var query='[out:json][timeout:10];(way["building"]('+bbox+'));out body geom;';
+    var url='https://overpass-api.de/api/interpreter?data='+encodeURIComponent(query);
+    fetch(url).then(function(r){{return r.json()}}).then(function(data){{
+      var features=[];
+      (data.elements||[]).forEach(function(el){{
+        if(!el.geometry||el.geometry.length<3) return;
+        var coords=el.geometry.map(function(g){{return [g.lon,g.lat]}});
+        coords.push(coords[0]); // close ring
+        var height=parseInt(el.tags&&el.tags['building:levels']||'4')*3;
+        if(el.tags&&el.tags.height) height=parseFloat(el.tags.height)||height;
+        features.push({{
+          type:'Feature',
+          properties:{{height:Math.min(height,200),name:el.tags&&el.tags.name||''}},
+          geometry:{{type:'Polygon',coordinates:[coords]}}
+        }});
+      }});
+      if(features.length>0 && map.getSource('buildings')){{
+        map.getSource('buildings').setData({{type:'FeatureCollection',features:features}});
+      }}
+    }}).catch(function(e){{console.log('Buildings load failed:',e)}});
+  }}
+
 }} catch(ex) {{
   offlineDiv.style.display='flex';
   console.error('Map init failed:',ex);

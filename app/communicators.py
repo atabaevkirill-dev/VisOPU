@@ -424,6 +424,7 @@ class ONVIFCommunicator(QObject):
         self._ptz = None
         self._ptz_config = None
         self._profile_token = None
+        self._video_source_token = None
         self.connected = False
 
     def connect_device(self, ip, user="admin", password="admin", port=80):
@@ -458,8 +459,11 @@ class ONVIFCommunicator(QObject):
             if not profiles:
                 self.error_occurred.emit("No ONVIF profiles found on camera")
                 return
-            self._profile_token = profiles[0].token
-
+            profile = profiles[0]
+            self._profile_token = profile.token
+            vsc = getattr(profile, 'VideoSourceConfiguration', None)
+            self._video_source_token = (
+                vsc.SourceToken if vsc is not None else None)
 
             # Get PTZ service
             self._ptz = self._cam.create_ptz_service()
@@ -481,18 +485,20 @@ class ONVIFCommunicator(QObject):
         self._ptz = None
         self._ptz_config = None
         self._profile_token = None
+        self._video_source_token = None
         self.connected = False
         self.connection_changed.emit(False)
 
-    def _make_velocity(self, pan=0.0, tilt=0.0, zoom=0.0):
-        """Create PTZSpeed velocity structure."""
-        request = self._ptz.create_type('ContinuousMove')
-        request.ProfileToken = self._profile_token
-        request.Velocity = {
-            'PanTilt': {'x': pan, 'y': tilt},
-            'Zoom': {'x': zoom}
-        }
-        return request
+    def _imaging_move_focus(self, speed: float):
+        """Continuous focus via ONVIF Imaging service (-1=far, +1=near)."""
+        if not self._cam or not self._video_source_token:
+            return
+        imaging = self._cam.create_imaging_service()
+        speed = max(-1.0, min(1.0, speed))
+        request = imaging.create_type('Move')
+        request.VideoSourceToken = self._video_source_token
+        request.Focus = {'Continuous': {'Speed': speed}}
+        imaging.Move(request)
 
     def zoom_in(self, speed=0.5):
         """Zoom Tele (in). speed: 0.0-1.0."""
@@ -534,39 +540,50 @@ class ONVIFCommunicator(QObject):
             self.error_occurred.emit(f"Stop: {e}")
 
     def focus_near(self, speed=0.5):
-        """Focus near via ONVIF Move operation."""
-        if not self.connected or not self._ptz:
+        """Focus near via ONVIF Imaging continuous move."""
+        if not self.connected or not self._cam:
             return
         try:
-            speed = max(0.0, min(1.0, speed))
-            request = self._ptz.create_type('ContinuousMove')
-            request.ProfileToken = self._profile_token
-            request.Velocity = {'PanTilt': {'x': 0, 'y': 0}, 'Zoom': {'x': speed}}
-            self._ptz.ContinuousMove(request)
+            self._imaging_move_focus(max(0.0, min(1.0, speed)))
         except Exception as e:
             self.error_occurred.emit(f"FocusNear: {e}")
 
     def focus_far(self, speed=0.5):
-        """Focus far via ONVIF Move operation."""
-        if not self.connected or not self._ptz:
-            return
-        try:
-            speed = max(0.0, min(1.0, speed))
-            request = self._ptz.create_type('ContinuousMove')
-            request.ProfileToken = self._profile_token
-            request.Velocity = {'PanTilt': {'x': 0, 'y': 0}, 'Zoom': {'x': -speed}}
-            self._ptz.ContinuousMove(request)
-        except Exception as e:
-            self.error_occurred.emit(f"FocusFar: {e}")
-
-    def focus_auto(self):
-        """Enable auto-focus via ONVIF Imaging service."""
+        """Focus far via ONVIF Imaging continuous move."""
         if not self.connected or not self._cam:
             return
         try:
+            self._imaging_move_focus(-max(0.0, min(1.0, speed)))
+        except Exception as e:
+            self.error_occurred.emit(f"FocusFar: {e}")
+
+    def focus_stop(self):
+        """Stop focus movement via ONVIF Imaging service."""
+        if not self.connected or not self._cam or not self._video_source_token:
+            return
+        try:
             imaging = self._cam.create_imaging_service()
-            # Get video source config token
-            configs = imaging.GetMoveOptions(0)  # source token 0
+            request = imaging.create_type('Stop')
+            request.VideoSourceToken = self._video_source_token
+            imaging.Stop(request)
+        except Exception as e:
+            self.error_occurred.emit(f"FocusStop: {e}")
+
+    def focus_auto(self):
+        """Enable auto-focus via ONVIF Imaging service."""
+        if not self.connected or not self._cam or not self._video_source_token:
+            return
+        try:
+            imaging = self._cam.create_imaging_service()
+            token = self._video_source_token
+            settings = imaging.GetImagingSettings({'VideoSourceToken': token})
+            if settings.Focus is not None:
+                settings.Focus.AutoFocusMode = 'AUTO'
+            imaging.SetImagingSettings({
+                'VideoSourceToken': token,
+                'ImagingSettings': settings,
+                'ForcePersistence': True,
+            })
         except Exception as e:
             self.error_occurred.emit(f"AutoFocus: {e}")
 

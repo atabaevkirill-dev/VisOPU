@@ -1,196 +1,199 @@
 # VisOPU
 
-**TL.0009 Pan-Tilt Device Control & Surveillance Platform**
+**Платформа управления поворотно-наклонным устройством TL.0009 и видеонаблюдения**
 
-VisOPU is a professional-grade desktop application for controlling the **TL.0009** pan-tilt platform, integrating IP camera streams (including thermal), YOLO-based object detection, laser rangefinding, and offline tactical mapping — all in a single unified interface.
+Профессиональное десктопное приложение для управления поворотно-наклонной платформой **TL.0009**, интеграции IP-камер (включая тепловизор), детекции объектов на базе YOLO, лазерного дальномера и тактической офлайн-карты в едином интерфейсе.
 
 ---
 
-## Features
+## Возможности
 
-| Module | Description |
+| Модуль | Описание |
 |---|---|
-| **Pan-Tilt Control** | Precise speed/position control of TL.0009 via TCP. Auto-polling of position, speed, and temperature. |
-| **Dual Camera** | RTSP/ONVIF IP camera streams with overlay buttons (zoom, focus, laser, detect, track, filters). |
-| **Thermal Camera** | Pseudocolor palettes (WhiteHot, BlackHot, Iron, Rainbow, Arctic, Lava, Hot) with EMA-smoothed temperature display and FLIR-style HUD. |
-| **YOLO Detection** | Real-time object detection with ByteTrack multi-target tracking, CLAHE preprocessing, and multi-frame confirmation. |
-| **Laser Rangefinder** | 3 km LRF module with continuous/single ranging, distance overlay on camera view. |
-| **Offline Map** | Leaflet-based tactical map with MBTiles support, distance measurement, bearing lines, and beam visualization. |
-| **Keyboard Control** | Arrow keys for pan/tilt, Q/E for zoom, spacebar for stop — full hands-free operation. |
-| **Pelco-D / ONVIF** | Full PTZ protocol support for zoom, focus, and iris via Pelco-D binary frames or ONVIF SOAP. |
+| **Управление ПН** | Точное управление скоростью и позицией TL.0009 по TCP. Автоматический опрос углов, скоростей и температуры. |
+| **Двойная камера** | RTSP/ONVIF видеопотоки с оверлейными кнопками (зум, фокус, лазер, детекция, трекинг, фильтры). |
+| **Тепловизор** | Псевдоцветные палитры (WhiteHot, BlackHot, Iron, Rainbow, Arctic, Lava, Hot) с EMA-сглаживанием температуры и HUD в стиле FLIR. |
+| **Детекция YOLO** | Детекция объектов в реальном времени с мультиобъектным трекингом ByteTrack и CLAHE-предобработкой. |
+| **Лазерный дальномер** | Модуль LRF с дальностью 3 км, непрерывный/одиночный замер, наложение дистанции на видео. |
+| **Тактическая карта** | Карта Leaflet с поддержкой MBTiles, измерением расстояний, линиями азимута и визуализацией луча. |
+| **Клавиатура** | Стрелки — поворот/наклон, Q/E — зум, пробел — стоп. Полноценное управление без мыши. |
+| **Pelco-D / ONVIF** | Полная поддержка протоколов PTZ: зум, фокус, диафрагма через Pelco-D или ONVIF SOAP. |
+| **Панель Dashboard** | Центральная приборная панель с круговыми датчиками PAN/TILT/дальность/температура и карточками статусов устройств. |
 
 ---
 
-## Architecture
+## Архитектура
 
 ```
 VisOPU/
-├── main.py                  # Entry point — logging, exception handling, Qt setup
+├── main.py                  # Точка входа — логирование, обработка исключений, Qt
 ├── app/
-│   ├── mainwindow.py        # MainWindow — device wiring, UI layout, signal routing
-│   ├── widgets.py           # CameraWidget, CollapsiblePanel, SlidingPanel
+│   ├── mainwindow.py        # MainWindow — компоновка UI, маршрутизация сигналов
+│   ├── widgets.py           # CameraWidget, DashboardWidget, SlidingPanel
 │   ├── communicators.py     # DeviceCommunicator, LaserCommunicator, PelcoD, ONVIF
-│   ├── detector.py          # YoloDetector — multi-frame confirmation + ByteTrack
-│   ├── offline_map.py       # MBTilesServer — local Leaflet tile server
-│   └── styles.py            # Apple-style dark theme stylesheet
-├── data/                    # Offline map tiles (*.mbtiles)
-├── VisOPU.spec              # PyInstaller build specification
-├── build.bat                # One-click build script
-├── run.bat                  # Quick launch for development
-└── requirements.txt         # Python dependencies
+│   ├── detector.py          # YoloDetector — мультикадровая фильтрация + ByteTrack
+│   ├── offline_map.py       # MBTilesServer — локальный сервер тайлов Leaflet
+│   └── styles.py            # Тёмная тема в стиле Apple
+├── data/                    # Тайлы офлайн-карты (*.mbtiles)
+├── VisOPU.spec              # Спецификация сборки PyInstaller
+├── build.bat                # Скрипт сборки одной командой
+├── run.bat                  # Быстрый запуск для разработки
+└── requirements.txt         # Python-зависимости
 ```
 
 ---
 
-## Installation
+## Установка
 
-### Prerequisites
+### Требования
 
-- **Python 3.10+** (tested with 3.14)
-- **Windows 10/11** (QtWebEngine requirement)
+- **Python 3.10+** (протестировано на 3.14)
+- **Windows 10/11** (требуется QtWebEngine)
 
-### Setup
+### Запуск
 
 ```bash
-# Clone the repository
+# Клонировать репозиторий
 git clone https://github.com/atabaevkirill-dev/VisOPU.git
 cd VisOPU
 
-# Install dependencies
+# Установить зависимости
 pip install -r requirements.txt
 
-# Download YOLO models (place in project root)
-# yolov8n.pt (~6 MB) and/or yolov8m.pt (~50 MB) from ultralytics
+# Скачать модели YOLO (поместить в корень проекта)
+# yolov8n.pt (~6 МБ) и/или yolov8m.pt (~50 МБ) из ultralytics
 
-# Run the application
+# Запустить приложение
 python main.py
+# или использовать run.bat на Windows
 ```
 
-### Build Executable
+### Сборка EXE
 
 ```bash
-# Install PyInstaller
+# Установить PyInstaller
 pip install pyinstaller
 
-# Build (creates dist/VisOPU/VisOPU.exe)
+# Собрать (результат: dist/VisOPU/VisOPU.exe)
 pyinstaller VisOPU.spec --clean --noconfirm
-# or use build.bat on Windows
+# или использовать build.bat
 ```
 
 ---
 
-## Usage
+## Использование
 
-### 1. Connect TL.0009 Device
+### 1. Подключение TL.0009
 
-1. Enter the device IP and port in the connection panel
-2. Click **Connect** — the status indicator turns green
-3. Use sliders to set pan/tilt speed, or enter exact position values
-4. Keyboard: **Arrow keys** for pan/tilt, **Q/E** for zoom
+1. Введите IP и порт устройства в диалоге подключения
+2. Статус-индикатор загорится зелёным при успешном соединении
+3. Используйте слайдеры для установки скорости PAN/TILT или введите точные значения углов
+4. **Клавиатура**: стрелки — поворот/наклон, **Q/E** — зум
 
-### 2. Connect Cameras
+### 2. Подключение камер
 
-- **CAM1** — Standard IP camera (RTSP URL)
-- **CAM2** — Thermal camera (RTSP URL, enables thermal palette/temperature overlay)
+- **CAM1** — IP-камера дневного канала (RTSP URL)
+- **CAM2** — Тепловизионная камера (RTSP URL, активирует палитры и наложение температуры)
 
-### 3. Object Detection
+### 3. Детекция объектов
 
-1. Click **DETECT** overlay button on camera view to enable YOLO
-2. Click **TRACK** to enable multi-object ByteTrack tracking
-3. Use the class filter to focus on specific target types
+1. Нажмите **DETECT** на оверлее камеры для запуска YOLO
+2. Нажмите **TRACK** для включения мультиобъектного трекинга ByteTrack
+3. Используйте фильтр классов для выделения нужных типов целей
 
-### 4. Laser Rangefinder
+### 4. Лазерный дальномер
 
-1. Enter LRF module IP and connect
-2. Single or continuous ranging modes available
-3. Distance is overlaid on the camera view with target labels
+1. Введите IP модуля LRF и подключитесь
+2. Доступны режимы одиночного и непрерывного замера
+3. Дистанция отображается на видео с метками цели
 
-### 5. Tactical Map
+### 5. Тактическая карта
 
-- **Left-click** — place measurement points
-- **Right-click** — set device position
-- Map supports offline MBTiles for disconnected operation
-- Beam visualization shows pan direction on the map
+- **ЛКМ** — поставить точку измерения
+- **ПКМ** — установить позицию устройства
+- Поддержка офлайн-тайлов MBTiles для автономной работы
+- Визуализация луча показывает направление поворота на карте
 
 ---
 
-## Configuration
+## Конфигурация
 
-The application auto-detects:
-- GPU availability (CUDA for YOLO acceleration)
-- YOLO model files in the project directory
-- MBTiles files in `data/` for offline maps
-- ONVIF camera capabilities (zoom, focus, PTZ)
+Приложение автоматически определяет:
+- Наличие GPU (CUDA для ускорения YOLO)
+- Файлы моделей YOLO в каталоге проекта
+- Файлы MBTiles в `data/` для офлайн-карты
+- Возможности ONVIF-камер (зум, фокус, PTZ)
 
-### Camera Overlay Buttons
+### Оверлейные кнопки камеры
 
-| Button | Function |
+| Кнопка | Функция |
 |---|---|
-| **LSR** | Toggle laser distance overlay |
-| **DET** | Toggle YOLO detection |
-| **TRK** | Toggle ByteTrack tracking |
-| **FLT** | Cycle video filters (Normal → NVG → Edge → B&W) |
-| **PAL** | Cycle thermal palette (thermal camera only) |
-| **TMP** | Toggle temperature HUD (thermal camera only) |
+| **LSR** | Переключить наложение дистанции лазера |
+| **DET** | Включить/выключить детекцию YOLO |
+| **TRK** | Включить/выключить трекинг ByteTrack |
+| **FLT** | Цикл видеофильтров (Normal → NVG → Edge → B&W) |
+| **PAL** | Переключение палитры тепловизора |
+| **TMP** | Переключение HUD температуры |
 
 ---
 
-## Thermal Camera
+## Тепловизор
 
-The thermal module follows FLIR/InfiRay/Seek Thermal best practices:
+Модуль тепловизора реализован по лучшим практикам FLIR/InfiRay/Seek Thermal:
 
-- **EMA smoothing** (α=0.15) for stable temperature display
-- **7×7 pixel averaging** for noise-resistant spot readings
-- **Percentile-based auto-range** (1st/99th) for optimal contrast
-- **MAX hold** (2-second peak retention) per FLIR convention
-- **4 Hz update rate** for smooth, non-flickering display
+- **EMA-сглаживание** (α=0.15) для стабильного отображения температуры
+- **Усреднение по ROI 7×7 пикселей** для шумоустойчивых замеров
+- **MAX-удержание** (2 сек) по стандарту FLIR
+- **Частота обновления 4 Гц** для плавного неотвлекающего отображения
 
 ---
 
-## Supported Protocols
+## Поддерживаемые протоколы
 
-| Protocol | Device | Features |
+| Протокол | Устройство | Функции |
 |---|---|---|
-| **TL.0009 TCP** | Pan-tilt platform | Speed, position, temperature polling |
-| **RTSP** | IP cameras | Video stream via FFmpeg |
-| **Pelco-D** | PTZ cameras | Pan, tilt, zoom, focus, iris |
-| **ONVIF** | IP cameras | PTZ control, zoom, focus |
-| **Binary TCP** | 3km LRF module | Single/continuous ranging |
+| **TL.0009 TCP** | ПН-платформа | Опрос скорости, позиции, температуры |
+| **RTSP** | IP-камеры | Видеопоток через FFmpeg |
+| **Pelco-D** | PTZ-камеры | Поворот, наклон, зум, фокус, диафрагма |
+| **ONVIF** | IP-камеры | Управление PTZ, зум, фокус |
+| **Binary TCP** | Модуль LRF 3 км | Одиночный/непрерывный замер |
 
 ---
 
-## Requirements
+## Системные требования
 
-| Component | Minimum | Recommended |
+| Компонент | Минимум | Рекомендуется |
 |---|---|---|
-| OS | Windows 10 | Windows 11 |
+| ОС | Windows 10 | Windows 11 |
 | Python | 3.10 | 3.12+ |
-| RAM | 4 GB | 8 GB |
-| GPU | Integrated | NVIDIA (CUDA) |
-| Network | 100 Mbps | 1 Gbps |
+| ОЗУ | 4 ГБ | 8 ГБ |
+| GPU | Встроенный | NVIDIA (CUDA) |
+| Сеть | 100 Мбит/с | 1 Гбит/с |
 
 ---
 
-## Project Structure
+## Горячие клавиши
 
-```
-main.py                 Entry point with exception handling and Qt setup
-app/mainwindow.py       Main window — device panels, signal wiring, UI
-app/widgets.py          Camera widget with thermal/detection/overlay support
-app/communicators.py    TCP protocol handlers (TL.0009, LRF, Pelco-D, ONVIF)
-app/detector.py         YOLO detector with ByteTrack and CLAHE
-app/offline_map.py      Local MBTiles/OSM tile server with Leaflet
-app/styles.py           Dark mode Apple-style theme
-```
-
----
-
-## License
-
-This project is proprietary. All rights reserved.
+| Клавиша | Действие |
+|---|---|
+| **← →** | Поворот PAN |
+| **↑ ↓** | Наклон TILT |
+| **Q / E** | Зум (Wide / Tele) |
+| **Пробел** | Остановить всё |
+| **H** | Домой (0°/0°) |
+| **Escape** | Сброс трекинга |
+| **F1** | Окно камер |
+| **F2** | Окно карты |
+| **F3** | Окно логов |
 
 ---
 
-## Author
+## Лицензия
 
-**Kirill Atabaev** — [atabaevkirill-dev](https://github.com/atabaevkirill-dev)
+Проприетарное ПО. Все права защищены.
+
+---
+
+## Автор
+
+**Кирилл Атабаев** — [atabaevkirill-dev](https://github.com/atabaevkirill-dev)
